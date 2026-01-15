@@ -4,142 +4,120 @@ import numpy as np
 import plotly.express as px
 from scipy.stats import norm
 from datetime import datetime
+import re
 
-# --- Constants: Bayesian Parameters from PDF [cite: 61] ---
+# --- Constants: JNP 2024 Parameters ---
 NUCLEI_PARAMS = {
     "13C":    {"exp_c": 0.547, "sig_c": 0.253, "exp_i": -0.487, "sig_i": 0.533},
     "1H":     {"exp_c": 0.478, "sig_c": 0.305, "exp_i": -0.786, "sig_i": 0.835},
     "13C+1H": {"exp_c": 0.512, "sig_c": 0.209, "exp_i": -0.637, "sig_i": 0.499}
 }
 
-# --- Page Configuration ---
-st.set_page_config(page_title="CP3-Bayes Analyzer v3.4.1", layout="wide")
-st.title("🧪 Advanced CP3-Bayes Analyzer Ver. 3.4.1")
-st.markdown("##### *Abe-lab Official Statistical Platform for Structural Determination*")
+st.set_page_config(page_title="CP3-Bayes Analyzer v3.4.2", layout="wide")
+st.title("🧪 Advanced CP3-Bayes Analyzer Ver. 3.4.2")
+st.markdown("##### *Abe-lab Official Platform - Triple-Mode Integration*")
 
-# Initialize session state for tracking analysis
-if 'analyzed' not in st.session_state:
-    st.session_state.analyzed = False
-if 'final_df' not in st.session_state:
-    st.session_state.final_df = None
-if 'summary_df' not in st.session_state:
-    st.session_state.summary_df = None
+# Initialize session state
+if 'results' not in st.session_state: st.session_state.results = None
+if 'analyzed' not in st.session_state: st.session_state.analyzed = False
 
-# --- Abe-lab's 6 Crucial Points (Notes) ---
-with st.expander("📝 Abe-lab's 6 Crucial Points (Check before analysis)"):
-    st.markdown("""
-    1. **Pairing Issues**: Verify ID matching (e.g., conf01) in BRIDGE v1.0.
-    2. **Energy Extraction**: Ensure 'Normal termination' and ΔG exist in logs.
-    3. **Atom Count**: Match CSV rows with the Gaussian atom numbering.
-    4. **Probability Near 50%**: Check for minimal structural difference or input errors.
-    5. **Low CP3 Score**: Verify Scaling Factors or conformational search depth.
-    6. **Error Bypass**: The tool automatically substitutes $0.0001$ for Δ=0.
-    """)
-
-# --- UI: Dual-Window File Uploader ---
-st.subheader("📁 Phase 1: Data Input")
+# --- Phase 1: Dual-Window Input (Fixed UI) ---
+st.subheader("📁 Phase 1: Dual-Window Data Input")
 col_exp, col_calc = st.columns(2)
 
 with col_exp:
     st.info("**Window 1: Experimental Data**")
-    exp_file = st.file_uploader("Upload Experimental Peak List (CSV)", type="csv")
+    exp_file = st.file_uploader("Upload Experimental Peak List (CSV)", type="csv", key="exp_up")
 
 with col_calc:
     st.info("**Window 2: Calculated Data**")
-    calc_file = st.file_uploader("Upload Boltzmann-Averaged Shifts (CSV)", type="csv")
+    calc_file = st.file_uploader("Upload Calculated Shifts from BRIDGE (CSV)", type="csv", key="calc_up")
 
-# Analysis Readiness
-ready_to_run = exp_file is not None and calc_file is not None
+# --- Phase 2: Action Section ---
+st.divider()
+st.subheader("🚀 Phase 2: Analysis")
 
-# --- Analysis Engine [cite: 12-63] ---
-def run_stat_analysis(df, n_key):
+# Check if both files are uploaded
+files_ready = (exp_file is not None) and (calc_file is not None)
+
+def run_analysis_logic(df, n_key):
     p = NUCLEI_PARAMS[n_key]
-    
-    # 1. Delta Calculation & Zero-Division Mitigation [cite: 16-17, 24]
+    # CP3 Core Calculation
     de = (df['Exp_Shift_A'] - df['Exp_Shift_B']).replace(0, 0.0001)
     dc = (df['Calc_A_Scaled'] - df['Calc_B_Scaled']).replace(0, 0.0001)
-
-    # 2. f3 Function Branching Logic 
+    
     f3_c = np.where(dc/de > 1, (de**3)/dc, de*dc)
     f3_i = np.where((-dc)/de > 1, (de**3)/(-dc), de*(-dc))
-
-    # 3. CP3 Score Calculation [cite: 26-27]
+    
     sum_de2 = np.sum(de**2)
-    cp3_c, cp3_i = np.sum(f3_c)/sum_de2, np.sum(f3_i)/sum_de2
+    c_cor, c_inc = np.sum(f3_c)/sum_de2, np.sum(f3_i)/sum_de2
     
-    # 4. Bayesian Transformation (1 - NORM.DIST) [cite: 57-60]
-    pr1_ac1 = 1 - norm.cdf(cp3_c, p['exp_c'], p['sig_c'])
-    pr2_ac1 = 1 - norm.cdf(cp3_i, p['exp_i'], p['sig_i'])
-    pr1_ac2 = 1 - norm.cdf(cp3_c, p['exp_i'], p['sig_i'])
-    pr2_ac2 = 1 - norm.cdf(cp3_i, p['exp_c'], p['sig_c'])
+    # Bayesian Probability Calculation
+    p1 = 1 - norm.cdf(c_cor, p['exp_c'], p['sig_c'])
+    p2 = 1 - norm.cdf(c_inc, p['exp_i'], p['sig_i'])
+    p3 = 1 - norm.cdf(c_cor, p['exp_i'], p['sig_i'])
+    p4 = 1 - norm.cdf(c_inc, p['exp_c'], p['sig_c'])
     
-    # Final Bayesian Probability [cite: 63]
-    prob = (pr1_ac1 * pr2_ac1) / ((pr1_ac1 * pr2_ac1) + (pr1_ac2 * pr2_ac2)) * 100
-    return cp3_c, cp3_i, prob
+    prob = (p1 * p2) / ((p1 * p2) + (p3 * p4)) * 100
+    return c_cor, c_inc, prob
 
-# --- Action Section ---
-st.divider()
-if st.button("🚀 Run Triple-Mode Analysis", use_container_width=True, disabled=not ready_to_run):
+if st.button("Run Triple-Mode Analysis", use_container_width=True, disabled=not files_ready):
     try:
         df_exp = pd.read_csv(exp_file)
         df_calc = pd.read_csv(calc_file)
-        
         merged = pd.merge(df_exp, df_calc, on="Atom_Label")
-        df_c = merged[merged['Atom_Label'].str.contains('C', na=False)]
-        df_h = merged[merged['Atom_Label'].str.contains('H', na=False)]
         
-        # 13C Analysis
-        c_c, c_i, c_p = run_stat_analysis(df_c, "13C")
-        # 1H Analysis
-        h_c, h_i, h_p = run_stat_analysis(df_h, "1H")
+        # Nuclei Filtering & Analysis
+        c_df = merged[merged['Atom_Label'].str.contains('C', na=False)]
+        h_df = merged[merged['Atom_Label'].str.contains('H', na=False)]
         
-        # 13C+1H Mixed Mode [cite: 25]
-        m_c, m_i = (c_c + h_c)/2, (c_i + h_i)/2
-        p_m = NUCLEI_PARAMS["13C+1H"]
-        pr1_ac1_m = 1-norm.cdf(m_c, p_m['exp_c'], p_m['sig_c'])
-        pr2_ac1_m = 1-norm.cdf(m_i, p_m['exp_i'], p_m['sig_i'])
-        pr1_ac2_m = 1-norm.cdf(m_c, p_m['exp_i'], p_m['sig_i'])
-        pr2_ac2_m = 1-norm.cdf(m_i, p_m['exp_c'], p_m['sig_c'])
-        m_p = (pr1_ac1_m * pr2_ac1_m) / ((pr1_ac1_m * pr2_ac1_m) + (pr1_ac2_m * pr2_ac2_m)) * 100
-
-        # Store results
-        st.session_state.summary_df = pd.DataFrame({
-            "Analysis Mode": ["13C Only", "1H Only", "13C + 1H Mixed"],
-            "Bayesian Prob. (A=a)": [f"{c_p:.2f}%", f"{h_p:.2f}%", f"{m_p:.2f}%"],
-            "CP3 Correct": [f"{c_c:.4f}", f"{h_c:.4f}", f"{m_c:.4f}"],
-            "CP3 Incorrect": [f"{c_i:.4f}", f"{h_i:.4f}", f"{m_i:.4f}"]
-        })
+        c_cor, c_inc, c_p = run_analysis_logic(c_df, "13C") if not c_df.empty else (0,0,0)
+        h_cor, h_inc, h_p = run_analysis_logic(h_df, "1H") if not h_df.empty else (0,0,0)
         
-        merged['de'] = (merged['Exp_Shift_A'] - merged['Exp_Shift_B']).replace(0, 0.0001)
-        merged['dc'] = (merged['Calc_A_Scaled'] - merged['Calc_B_Scaled']).replace(0, 0.0001)
-        st.session_state.final_df = merged
+        # Mixed Mode Calculation
+        m_cor, m_inc = (c_cor + h_cor)/2, (c_inc + h_inc)/2
+        pm = NUCLEI_PARAMS["13C+1H"]
+        m1 = 1 - norm.cdf(m_cor, pm['exp_c'], pm['sig_c'])
+        m2 = 1 - norm.cdf(m_inc, pm['exp_i'], pm['sig_i'])
+        m3 = 1 - norm.cdf(m_cor, pm['exp_i'], pm['sig_i'])
+        m4 = 1 - norm.cdf(m_inc, pm['exp_c'], pm['sig_c'])
+        m_p = (m1 * m2) / ((m1 * m2) + (m3 * m4)) * 100
+        
+        st.session_state.results = {
+            "summary": pd.DataFrame({
+                "Mode": ["13C Only", "1H Only", "13C + 1H Mixed"],
+                "Probability (A=a)": [f"{c_p:.2f}%", f"{h_p:.2f}%", f"{m_p:.2f}%"],
+                "CP3 (Correct)": [f"{c_cor:.4f}", f"{h_cor:.4f}", f"{m_cor:.4f}"],
+                "CP3 (Incorrect)": [f"{c_inc:.4f}", f"{h_inc:.4f}", f"{m_inc:.4f}"]
+            }),
+            "data": merged
+        }
         st.session_state.analyzed = True
-
     except Exception as e:
-        st.error(f"Error: {str(e)}")
+        st.error(f"Analysis Error: Please check CSV headers. Details: {e}")
 
-# --- Result Display ---
+# Results and Plotting
 if st.session_state.analyzed:
-    st.subheader("📊 Statistical Analysis Summary")
-    st.table(st.session_state.summary_df)
-
-    st.subheader("📈 JNP 2024 Correlation Plot (Δδ Analysis)")
-    fig = px.scatter(st.session_state.final_df, x="de", y="dc", text="Atom_Label", color="Atom_Label",
-                     labels={"de": "Δδ Experimental (ppm)", "dc": "Δδ Calculated (ppm)"},
-                     template="plotly_white")
-    fig.add_shape(type="line", x0=-1, y0=-1, x1=1, y1=1, line=dict(color="Red", dash="dash"))
+    st.success("Analysis Complete")
+    st.table(st.session_state.results["summary"])
+    
+    # JNP 2024 Correlation Plot
+    df_plot = st.session_state.results["data"]
+    df_plot['de'] = df_plot['Exp_Shift_A'] - df_plot['Exp_Shift_B']
+    df_plot['dc'] = df_plot['Calc_A_Scaled'] - df_plot['Calc_B_Scaled']
+    
+    fig = px.scatter(df_plot, x="de", y="dc", text="Atom_Label", color="Atom_Label",
+                     labels={"de": "Δδ Experimental (A-B)", "dc": "Δδ Calculated (a-b)"},
+                     title="Structural Correlation Plot (JNP 2024 Style)")
+    fig.add_shape(type="line", x0=min(df_plot['de']), y0=min(df_plot['de']), 
+                  x1=max(df_plot['de']), y1=max(df_plot['de']),
+                  line=dict(color="Red", dash="dash"))
     st.plotly_chart(fig, use_container_width=True)
 
-# --- Download Section ---
+# Export Section
 st.divider()
 if st.session_state.analyzed:
-    csv_data = st.session_state.final_df.to_csv(index=False).encode('utf-8')
-    st.download_button(
-        label="💾 Export Integrated SI Data (CSV)",
-        data=csv_data,
-        file_name=f"SI_Report_{datetime.now().strftime('%Y%m%d')}.csv",
-        mime="text/csv",
-        use_container_width=True
-    )
+    csv = st.session_state.results["data"].to_csv(index=False).encode('utf-8')
+    st.download_button("💾 Export Detailed SI Report (CSV)", data=csv, file_name="CP3_Analysis_Report.csv", use_container_width=True)
 else:
-    st.button("💾 Export Integrated SI Data (CSV)", disabled=True, use_container_width=True)
+    st.button("💾 Export Detailed SI Report (CSV)", disabled=True, use_container_width=True)
