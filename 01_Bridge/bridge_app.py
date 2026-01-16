@@ -30,14 +30,31 @@ def parse_energy_source(file_content, filename):
         return {"energy": float(scf_matches[-1]), "type": "SCF (E)", "filename": filename}
     return None
 
-def parse_nmr_source(file_content, filename):
+def parse_nmr_source_v18(file_content, filename):
+    """v1.8: Isotropic値に加え、テンソル成分(XX, YY, ZZ)も抽出する"""
     content = file_content.decode("utf-8")
-    nmr_pattern = re.compile(r"(\d+)\s+([A-Za-z]+)\s+Isotropic =\s+(-?\d+\.\d+)")
-    atoms = [{"index": int(m[0]), "element": m[1], "sigma": float(m[2])} for m in nmr_pattern.findall(content)]
+    # Isotropic値とそれに続くテンソル行をキャプチャ
+    nmr_pattern = re.compile(
+        r"(\d+)\s+([A-Za-z]+)\s+Isotropic =\s+(-?\d+\.\d+).*?"
+        r"XX=\s+(-?\d+\.\d+).*?"
+        r"YY=\s+(-?\d+\.\d+).*?"
+        r"ZZ=\s+(-?\d+\.\d+)", 
+        re.DOTALL
+    )
+    
+    atoms = []
+    for m in nmr_pattern.findall(content):
+        atoms.append({
+            "index": int(m[0]), 
+            "element": m[1], 
+            "sigma": float(m[2]),
+            "XX": float(m[3]),
+            "YY": float(m[4]),
+            "ZZ": float(m[5])
+        })
     return {"atoms": atoms, "filename": filename} if atoms else None
 
 def auto_pad_label(label, element, no):
-    """Excelでソートしやすいようにラベルを整形 (例: C1 -> C01)"""
     if label == "": return f"{element}{str(no).zfill(2)}_raw"
     match = re.search(r'(\D+)(\d+)$', label)
     if match:
@@ -46,15 +63,14 @@ def auto_pad_label(label, element, no):
     return label
 
 def natural_sort_key(s):
-    """C1, C2, C10を正しく並べるためのキー"""
     return [int(t) if t.isdigit() else t.lower() for t in re.split('([0-9]+)', str(s))]
 
 # --- UI Setup ---
-st.set_page_config(page_title="NMR DATA BRIDGE v1.7", layout="wide")
-st.title("🌉 NMR DATA BRIDGE Ver. 1.7")
-st.markdown("##### *Abe-lab Official Platform - Professional Output Mode*")
+st.set_page_config(page_title="NMR DATA BRIDGE v1.8", layout="wide")
+st.title("🌉 NMR DATA BRIDGE Ver. 1.8")
+st.markdown("##### *Professional Output Mode with Raw Tensor Verification*")
 
-# Session State for keeping data
+# Session State
 if 'processed_analysis' not in st.session_state: st.session_state.processed_analysis = False
 if 'processed_backup' not in st.session_state: st.session_state.processed_backup = False
 
@@ -62,15 +78,15 @@ with st.sidebar:
     st.header("⚙️ Configuration")
     temp = st.number_input("Temperature (K):", value=TEMP_DEFAULT)
     st.divider()
-    st.caption("Abe-lab, Gifu Pharmaceutical University.")
+    st.caption("Gifu Pharmaceutical University, Abe-lab.")
 
 # --- Phase 1: Upload ---
 st.subheader("📁 Phase 1: Upload Gaussian Log Files")
 col_up1, col_up2 = st.columns(2)
 with col_up1:
-    energy_files = st.file_uploader("Drop OPT files", type=["log", "out"], accept_multiple_files=True, key="up_energy")
+    energy_files = st.file_uploader("Drop OPT files (Energy)", type=["log", "out"], accept_multiple_files=True)
 with col_up2:
-    nmr_files = st.file_uploader("Drop NMR files", type=["log", "out"], accept_multiple_files=True, key="up_nmr")
+    nmr_files = st.file_uploader("Drop NMR files (Shielding)", type=["log", "out"], accept_multiple_files=True)
 
 if energy_files and nmr_files:
     # 1. Matching
@@ -78,15 +94,15 @@ if energy_files and nmr_files:
     matched_results = []
     for f in nmr_files:
         fid = get_file_id(f.name)
-        parsed_nmr = parse_nmr_source(f.getvalue(), f.name)
+        parsed_nmr = parse_nmr_source_v18(f.getvalue(), f.name)
         if parsed_nmr and fid in energy_map and energy_map[fid]:
             matched_results.append({
                 "id": fid, "filename_nmr": f.name, "filename_energy": energy_map[fid]["filename"],
                 "energy": energy_map[fid]["energy"], "energy_type": energy_map[fid]["type"], "atoms": parsed_nmr["atoms"]
             })
 
-    # 2. Boltzmann Table
     if matched_results:
+        # 2. Boltzmann Table
         energies = [r['energy'] for r in matched_results]
         min_e = min(energies)
         kb_t = KB_KCAL * temp / HARTREE_TO_KCAL
@@ -104,8 +120,31 @@ if energy_files and nmr_files:
         }).sort_values("ID")
         st.dataframe(dist_df.style.format(subset=["Rel. E (kcal/mol)", "Weight (%)"], formatter="{:.2f}"), use_container_width=True)
 
+        # --- v1.8 New Section: Raw Data Verification ---
+        st.subheader("🔍 Phase 2.5: Raw Data Verification (All Conformers)")
+        raw_rows = []
+        for r in matched_results:
+            for atom in r['atoms']:
+                raw_rows.append({
+                    "Conf_ID": r['id'],
+                    "Atom_No": atom['index'],
+                    "Element": atom['element'],
+                    "Isotropic": atom['sigma'],
+                    "XX": atom['XX'], "YY": atom['YY'], "ZZ": atom['ZZ']
+                })
+        raw_df = pd.DataFrame(raw_rows)
+        st.write("各配座異性体から抽出されたシールド定数およびテンソル成分の生データです：")
+        st.dataframe(raw_df, use_container_width=True)
+        
+        st.download_button(
+            "💾 Download Raw Tensors CSV",
+            data=raw_df.to_csv(index=False).encode('utf-8'),
+            file_name="NMR_Raw_Tensors_Check.csv",
+            use_container_width=False
+        )
+
         # 3. Atomic Labeling
-        st.subheader("🏷️ Phase 3: Atom Labeling")
+        st.subheader("🏷️ Phase 3: Atom Labeling & Averaging")
         base_atoms = matched_results[0]['atoms']
         atom_data = []
         for i in range(len(base_atoms)):
@@ -114,7 +153,7 @@ if energy_files and nmr_files:
         
         edited_df = st.data_editor(pd.DataFrame(atom_data), hide_index=True, use_container_width=True, key="editor")
 
-        # 4. Professional Export Phase
+        # 4. Export
         st.divider()
         st.subheader("🚀 Phase 4: Data Integration & Export")
         col_a, col_b = st.columns(2)
@@ -147,4 +186,4 @@ if energy_files and nmr_files:
                 st.download_button("💾 Download Backup CSV", data=st.session_state.data_backup.to_csv(index=False).encode('utf-8'), file_name="Calc_Data_Full_Backup.csv", use_container_width=True)
 
 elif (energy_files or nmr_files):
-    st.info("Awaiting both OPT and NMR files to enable export functions.")
+    st.info("Awaiting both OPT and NMR files to enable verification and export functions.")
