@@ -12,7 +12,7 @@ TEMP_DEFAULT = 298.15
 # --- Helper Functions ---
 
 def get_file_id(filename):
-    """ファイル名から拡張子を除いた部分の『最後』の数字を抽出して整数で返す。"""
+    """Extract the last integer from filename before extension."""
     name_part = filename.rsplit('.', 1)[0]
     nums = re.findall(r'(\d+)', name_part)
     return int(nums[-1]) if nums else None
@@ -30,10 +30,9 @@ def parse_energy_source(file_content, filename):
         return {"energy": float(scf_matches[-1]), "type": "SCF (E)", "filename": filename}
     return None
 
-def parse_nmr_source_v18(file_content, filename):
-    """v1.8: Isotropic値に加え、テンソル成分(XX, YY, ZZ)も抽出する"""
+def parse_nmr_source_v181(file_content, filename):
+    """Extract Isotropic values and diagonal tensor components (XX, YY, ZZ)."""
     content = file_content.decode("utf-8")
-    # Isotropic値とそれに続くテンソル行をキャプチャ
     nmr_pattern = re.compile(
         r"(\d+)\s+([A-Za-z]+)\s+Isotropic =\s+(-?\d+\.\d+).*?"
         r"XX=\s+(-?\d+\.\d+).*?"
@@ -66,9 +65,9 @@ def natural_sort_key(s):
     return [int(t) if t.isdigit() else t.lower() for t in re.split('([0-9]+)', str(s))]
 
 # --- UI Setup ---
-st.set_page_config(page_title="NMR DATA BRIDGE v1.8", layout="wide")
-st.title("🌉 NMR DATA BRIDGE Ver. 1.8")
-st.markdown("##### *Professional Output Mode with Raw Tensor Verification*")
+st.set_page_config(page_title="NMR DATA BRIDGE v1.8.1", layout="wide")
+st.title("🌉 NMR DATA BRIDGE Ver. 1.8.1")
+st.markdown("##### *Professional Output Mode - Gifu Pharm. Univ. Abe-lab*")
 
 # Session State
 if 'processed_analysis' not in st.session_state: st.session_state.processed_analysis = False
@@ -78,7 +77,7 @@ with st.sidebar:
     st.header("⚙️ Configuration")
     temp = st.number_input("Temperature (K):", value=TEMP_DEFAULT)
     st.divider()
-    st.caption("Gifu Pharmaceutical University, Abe-lab.")
+    st.caption("Abe-lab, Gifu Pharmaceutical University.")
 
 # --- Phase 1: Upload ---
 st.subheader("📁 Phase 1: Upload Gaussian Log Files")
@@ -89,12 +88,11 @@ with col_up2:
     nmr_files = st.file_uploader("Drop NMR files (Shielding)", type=["log", "out"], accept_multiple_files=True)
 
 if energy_files and nmr_files:
-    # 1. Matching
     energy_map = {get_file_id(f.name): parse_energy_source(f.getvalue(), f.name) for f in energy_files if get_file_id(f.name) is not None}
     matched_results = []
     for f in nmr_files:
         fid = get_file_id(f.name)
-        parsed_nmr = parse_nmr_source_v18(f.getvalue(), f.name)
+        parsed_nmr = parse_nmr_source_v181(f.getvalue(), f.name)
         if parsed_nmr and fid in energy_map and energy_map[fid]:
             matched_results.append({
                 "id": fid, "filename_nmr": f.name, "filename_energy": energy_map[fid]["filename"],
@@ -102,7 +100,7 @@ if energy_files and nmr_files:
             })
 
     if matched_results:
-        # 2. Boltzmann Table
+        # 2. Boltzmann Summary
         energies = [r['energy'] for r in matched_results]
         min_e = min(energies)
         kb_t = KB_KCAL * temp / HARTREE_TO_KCAL
@@ -120,7 +118,7 @@ if energy_files and nmr_files:
         }).sort_values("ID")
         st.dataframe(dist_df.style.format(subset=["Rel. E (kcal/mol)", "Weight (%)"], formatter="{:.2f}"), use_container_width=True)
 
-        # --- v1.8 New Section: Raw Data Verification ---
+        # --- Phase 2.5: Raw Data Verification (Updated to English) ---
         st.subheader("🔍 Phase 2.5: Raw Data Verification (All Conformers)")
         raw_rows = []
         for r in matched_results:
@@ -133,7 +131,8 @@ if energy_files and nmr_files:
                     "XX": atom['XX'], "YY": atom['YY'], "ZZ": atom['ZZ']
                 })
         raw_df = pd.DataFrame(raw_rows)
-        st.write("各配座異性体から抽出されたシールド定数およびテンソル成分の生データです：")
+        # ここを英語に修正しました
+        st.write("Raw shielding constants and tensor components extracted from each conformer:")
         st.dataframe(raw_df, use_container_width=True)
         
         st.download_button(
@@ -162,9 +161,7 @@ if energy_files and nmr_files:
             st.markdown("##### **[Analysis Mode]**")
             if st.button("Prepare Analysis Data", use_container_width=True):
                 df_labeled = edited_df[edited_df['Atom_Label'] != ""].copy()
-                if df_labeled.empty:
-                    st.warning("No labels found.")
-                else:
+                if not df_labeled.empty:
                     df_labeled['Atom_Label'] = df_labeled['Atom_Label'].apply(lambda x: auto_pad_label(x, "", ""))
                     res = df_labeled.groupby('Atom_Label')['Avg_Shielding'].mean().reset_index().rename(columns={'Avg_Shielding': 'Calc_Raw'})
                     st.session_state.data_analysis = res.sort_values(by='Atom_Label', key=lambda x: x.map(natural_sort_key))
