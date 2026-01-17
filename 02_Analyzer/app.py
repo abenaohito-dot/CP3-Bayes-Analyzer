@@ -3,7 +3,6 @@ import pandas as pd
 import numpy as np
 import plotly.express as px
 from scipy.stats import norm
-from sklearn.linear_model import LinearRegression
 
 # --- Constants: JNP 2024 Parameters ---
 NUCLEI_PARAMS = {
@@ -12,10 +11,10 @@ NUCLEI_PARAMS = {
     "13C+1H": {"exp_c": 0.512, "sig_c": 0.209, "exp_i": -0.637, "sig_i": 0.499}
 }
 
-st.set_page_config(page_title="CP3-Bayes Analyzer v3.7", layout="wide")
+st.set_page_config(page_title="CP3-Bayes Analyzer v3.7.1", layout="wide")
 
 # --- UI Header ---
-st.title("🧪 Advanced CP3-Bayes Analyzer Ver. 3.7")
+st.title("🧪 Advanced CP3-Bayes Analyzer Ver. 3.7.1")
 st.markdown("##### *Abe-lab Official Platform - Triple-Mode & BRIDGE Integration*")
 
 # --- Phase 1: Data Input (4-File System) ---
@@ -56,7 +55,7 @@ def run_analysis_logic(df, n_key):
     """CP3 values and Bayesian probability calculation."""
     p = NUCLEI_PARAMS[n_key]
     
-    # Delta-delta calculation
+    # Delta-delta calculation (Avoid zero division)
     de = (df['Exp_A'] - df['Exp_B']).replace(0, 0.0001)
     dc = (df['Scaled_a'] - df['Scaled_b']).replace(0, 0.0001)
     
@@ -68,7 +67,7 @@ def run_analysis_logic(df, n_key):
     c_cor = np.sum(f3_c) / sum_de2
     c_inc = np.sum(f3_i) / sum_de2
     
-    # Bayesian Probability
+    # Bayesian Probability Calculation
     p1 = 1 - norm.cdf(c_cor, p['exp_c'], p['sig_c'])
     p2 = 1 - norm.cdf(c_inc, p['exp_i'], p['sig_i'])
     p3 = 1 - norm.cdf(c_cor, p['exp_i'], p['sig_i'])
@@ -93,18 +92,19 @@ if st.button("Run Comprehensive Analysis", use_container_width=True):
             m = pd.merge(m, df_calc_a[['Atom_Label', 'Calc_a']], on="Atom_Label")
             m = pd.merge(m, df_calc_b[['Atom_Label', 'Calc_b']], on="Atom_Label").dropna()
 
-            # Apply Scaling
+            # Apply Scaling (Numpy-based logic to avoid sklearn dependency)
             for nuclei in ['C', 'H']:
                 mask = m['Atom_Label'].str.contains(nuclei, na=False)
                 if not mask.any(): continue
                 
                 if scaling_mode == "Internal (Auto-fit to your data)":
-                    # Internal Linear Regression (y = ax + b)
-                    x_train = pd.concat([m.loc[mask, 'Calc_a'], m.loc[mask, 'Calc_b']]).values.reshape(-1, 1)
+                    # Use np.polyfit for Linear Regression (y = sl*x + ic)
+                    x_train = pd.concat([m.loc[mask, 'Calc_a'], m.loc[mask, 'Calc_b']]).values
                     y_train = pd.concat([m.loc[mask, 'Exp_A'], m.loc[mask, 'Exp_B']]).values
-                    reg = LinearRegression().fit(x_train, y_train)
-                    m.loc[mask, 'Scaled_a'] = reg.predict(m.loc[mask, ['Calc_a']].values)
-                    m.loc[mask, 'Scaled_b'] = reg.predict(m.loc[mask, ['Calc_b']].values)
+                    sl, ic = np.polyfit(x_train, y_train, 1)
+                    
+                    m.loc[mask, 'Scaled_a'] = m.loc[mask, 'Calc_a'] * sl + ic
+                    m.loc[mask, 'Scaled_b'] = m.loc[mask, 'Calc_b'] * sl + ic
                 else:
                     # JNP 2024 Fixed Parameters (Slope/Intercept)
                     sl, ic = (-1.053, 181.2) if nuclei == 'C' else (-1.078, 31.8)
@@ -152,6 +152,6 @@ if st.button("Run Comprehensive Analysis", use_container_width=True):
         except Exception as e:
             st.error(f"Analysis Error: {e}. Please check if Atom_Labels are consistent across all files.")
 
-# --- Footer Export ---
+# --- Footer ---
 st.divider()
-st.markdown("© 2024 Abe-lab. CP3-Bayes Analyzer for Structural Elucidation.")
+st.markdown("© 2024 Abe-lab. Optimized for BRIDGE & JNP 2024.")
