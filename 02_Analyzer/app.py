@@ -11,15 +11,15 @@ NUCLEI_PARAMS = {
     "13C+1H": {"exp_c": 0.512, "sig_c": 0.209, "exp_i": -0.637, "sig_i": 0.499}
 }
 
-st.set_page_config(page_title="CP3-Bayes Analyzer v3.7.1", layout="wide")
+st.set_page_config(page_title="CP3-Bayes Analyzer v3.7.2", layout="wide")
 
 # --- UI Header ---
-st.title("🧪 Advanced CP3-Bayes Analyzer Ver. 3.7.1")
+st.title("🧪 Advanced CP3-Bayes Analyzer Ver. 3.7.2")
 st.markdown("##### *Abe-lab Official Platform - Triple-Mode & BRIDGE Integration*")
 
 # --- Phase 1: Data Input (4-File System) ---
 st.subheader("📁 Phase 1: Data Input")
-st.info("Structure A (a) and Structure B (b) files are required for CP3 comparative analysis.")
+st.info("Direct comparison of Structure a (calc) vs Exp A, and Structure b (calc) vs Exp B.")
 
 col_a, col_b = st.columns(2)
 
@@ -38,15 +38,16 @@ st.divider()
 st.subheader("⚙️ Phase 2: Scaling Strategy")
 
 st.markdown("""
-> 💡 **スケーリング選択の目安:**
-> - **Internal (自動):** 各核種（13C/1H）の原子数が **10点以上** ある場合に推奨。
-> - **JNP 2024 Fixed (固定):** 原子数が少ない場合や、計算レベルが B3LYP/6-31G(d) の場合に安定。
+> 💡 **Scaling Selection Guide:**
+> - **Internal (Regression):** Recommended for datasets with **≥10 nuclei** (13C or 1H). Performs molecule-specific linear fit.
+> - **JNP 2024 Fixed:** More stable for **small datasets** or when using standard B3LYP/6-31G(d) calculations.
 """)
 
 scaling_mode = st.radio(
     "Choose Scaling Method:",
-    ["Internal (Auto-fit to your data)", "JNP 2024 Fixed (B3LYP/6-31G(d))"],
-    horizontal=True
+    ["Internal (Linear Regression)", "JNP 2024 Fixed (B3LYP/6-31G(d))"],
+    horizontal=True,
+    help="Select 'Fixed' if the number of atoms is low (e.g., < 6) to avoid regression bias."
 )
 
 # --- Phase 3: Analysis Execution ---
@@ -70,7 +71,7 @@ def run_analysis_logic(df, n_key):
 
 if st.button("Run Comprehensive Analysis", use_container_width=True):
     if not (exp_a_file and exp_b_file and calc_a_file and calc_b_file):
-        st.error("Please upload all 4 required files.")
+        st.error("Missing Files: Please upload all 4 required files.")
     else:
         try:
             # Load Data
@@ -84,15 +85,15 @@ if st.button("Run Comprehensive Analysis", use_container_width=True):
             m = pd.merge(m, df_calc_a[['Atom_Label', 'Calc_a']], on="Atom_Label")
             m = pd.merge(m, df_calc_b[['Atom_Label', 'Calc_b']], on="Atom_Label").dropna()
 
-            # Scaling (Numpy-based logic)
+            # Scaling
             for nuclei in ['C', 'H']:
                 mask = m['Atom_Label'].str.contains(nuclei, na=False)
                 if not mask.any(): continue
                 
-                if scaling_mode == "Internal (Auto-fit to your data)":
+                if "Internal" in scaling_mode:
                     x = pd.concat([m.loc[mask, 'Calc_a'], m.loc[mask, 'Calc_b']]).values
                     y = pd.concat([m.loc[mask, 'Exp_A'], m.loc[mask, 'Exp_B']]).values
-                    sl, ic = np.polyfit(x, y, 1) # numpyだけで線形回帰
+                    sl, ic = np.polyfit(x, y, 1)
                     m.loc[mask, 'Scaled_a'] = m.loc[mask, 'Calc_a'] * sl + ic
                     m.loc[mask, 'Scaled_b'] = m.loc[mask, 'Calc_b'] * sl + ic
                 else:
@@ -100,7 +101,7 @@ if st.button("Run Comprehensive Analysis", use_container_width=True):
                     m.loc[mask, 'Scaled_a'] = m.loc[mask, 'Calc_a'] * sl + ic
                     m.loc[mask, 'Scaled_b'] = m.loc[mask, 'Calc_b'] * sl + ic
 
-            # Process
+            # Analyze
             c_df, h_df = m[m['Atom_Label'].str.contains('C')], m[m['Atom_Label'].str.contains('H')]
             c_res = run_analysis_logic(c_df, "13C") if not c_df.empty else (0,0,0)
             h_res = run_analysis_logic(h_df, "1H") if not h_df.empty else (0,0,0)
@@ -109,8 +110,8 @@ if st.button("Run Comprehensive Analysis", use_container_width=True):
             st.divider()
             st.balloons()
             cols = st.columns(3)
-            cols[0].metric("13C Prob", f"{c_res[2]:.1f}%")
-            cols[1].metric("1H Prob", f"{h_res[2]:.1f}%")
+            cols[0].metric("13C Probability", f"{c_res[2]:.1f}%")
+            cols[1].metric("1H Probability", f"{h_res[2]:.1f}%")
             
             # Mixed Mode
             m_cor, m_inc = (c_res[0]+h_res[0])/2, (c_res[1]+h_res[1])/2
@@ -118,18 +119,20 @@ if st.button("Run Comprehensive Analysis", use_container_width=True):
             m1, m2 = 1-norm.cdf(m_cor, pm['exp_c'], pm['sig_c']), 1-norm.cdf(m_inc, pm['exp_i'], pm['sig_i'])
             m3, m4 = 1-norm.cdf(m_cor, pm['exp_i'], pm['sig_i']), 1-norm.cdf(m_inc, pm['exp_c'], pm['sig_c'])
             m_p = (m1 * m2) / ((m1 * m2) + (m3 * m4) + 1e-15) * 100
-            cols[2].metric("Mixed Prob", f"{m_p:.1f}%")
+            cols[2].metric("Mixed Probability", f"{m_p:.1f}%", delta="FINAL SCORE", delta_color="normal")
 
             # Plot
             m['de'], m['dc'] = m['Exp_A'] - m['Exp_B'], m['Scaled_a'] - m['Scaled_b']
             fig = px.scatter(m, x="de", y="dc", color="Atom_Label", text="Atom_Label",
-                             labels={"de": "Exp Delta", "dc": "Calc Delta"}, title="Correlation")
+                             labels={"de": "Δδ Experimental", "dc": "Δδ Calculated (Scaled)"}, title="Chemical Shift Correlation")
             fig.add_shape(type="line", x0=m['de'].min(), y0=m['de'].min(), x1=m['de'].max(), y1=m['de'].max(), line=dict(color="Red", dash="dash"))
             st.plotly_chart(fig, use_container_width=True)
-            st.dataframe(m)
+            
+            with st.expander("Show Results Data Table"):
+                st.dataframe(m)
 
         except Exception as e:
-            st.error(f"Error: {e}")
+            st.error(f"Execution Error: {e}")
 
 st.divider()
-st.caption("CP3-Bayes Ver. 3.7.1 - Dependency Optimized")
+st.caption("CP3-Bayes Ver. 3.7.2 - Optimized for JNP 2024 Guidelines")
