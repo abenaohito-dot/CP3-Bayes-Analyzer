@@ -38,9 +38,99 @@ def parse_energy_source(file_bytes, filename):
     
     return None
 
+def clean_gaussian_route_string(raw_route):
+    """Normalize route string by joining split words caused by Gaussian line-wrapping."""
+    lines = [line.strip() for line in raw_route.splitlines() if line.strip()]
+    full_str = " ".join(lines)
+    full_str = re.sub(r'=\s+', '=', full_str)
+    full_str = re.sub(r'\s+=', '=', full_str)
+    full_str = re.sub(r'empiricaldispersion=g\s+d3', 'empiricaldispersion=gd3', full_str, flags=re.IGNORECASE)
+    full_str = re.sub(r'geom=conn\s+ectivity', 'geom=connectivity', full_str, flags=re.IGNORECASE)
+    return full_str
+
+def parse_route_details(original_route):
+    """
+    Extract method_basis, solvent_model, solvent_name, and dispersion from original Gaussian route.
+    """
+    if not original_route:
+        return {
+            "method_basis": "wb97xd/6-311+g(d,p)",
+            "solvent_model": "iefpcm",
+            "solvent_name": "acetone",
+            "dispersion": None
+        }
+    
+    normalized = clean_gaussian_route_string(original_route)
+    
+    # 1. Method / Basis (例: wb97xd/6-311+g(d,p), B3LYP/6-31G*, m062x/def2tzvp)
+    method_basis = None
+    mb_match = re.search(r'(?:^|\s)(?:#\w*\s+)?([A-Za-z0-9_\-\+\*]+/[A-Za-z0-9_\-\+\*\(\),]+)', normalized, re.IGNORECASE)
+    if mb_match:
+        method_basis = mb_match.group(1)
+    else:
+        tokens = normalized.split()
+        method_basis = "wb97xd/6-311+g(d,p)"
+        for tok in tokens:
+            if "/" in tok and not tok.lower().startswith(("opt", "int", "scrf", "geom", "guess")):
+                method_basis = tok
+                break
+                
+    # 2. Solvation (SCRF)
+    solvent_model = "gas"
+    solvent_name = ""
+    s_m = re.search(r'scrf(?:\s*=\s*(?:\(([^\)]+)\)|([^\s]+)))?', normalized, re.IGNORECASE)
+    if s_m:
+        scrf_content = s_m.group(1) or s_m.group(2) or ""
+        scrf_lower = scrf_content.lower()
+        if "smd" in scrf_lower:
+            solvent_model = "smd"
+        elif "iefpcm" in scrf_lower:
+            solvent_model = "iefpcm"
+        elif "pcm" in scrf_lower:
+            solvent_model = "pcm"
+        else:
+            solvent_model = "iefpcm"
+            
+        solv_m = re.search(r'solvent\s*=\s*([A-Za-z0-9_\-]+)', scrf_content, re.IGNORECASE)
+        if solv_m:
+            solvent_name = solv_m.group(1).lower()
+        else:
+            solvent_name = "acetone"
+            
+    # 3. Empirical Dispersion
+    d_m = re.search(r'(empiricaldispersion=[^\s]+)', normalized, re.IGNORECASE)
+    dispersion = d_m.group(1) if d_m else None
+    
+    return {
+        "method_basis": method_basis,
+        "solvent_model": solvent_model,
+        "solvent_name": solvent_name,
+        "dispersion": dispersion
+    }
+
+def compose_route(method_basis, solvent_model, solvent_name, dispersion=None):
+    """Safely build route section from modular components."""
+    parts = ["#p", method_basis.strip()]
+    if dispersion and "b3lyp" in method_basis.lower() and "empiricaldispersion" not in method_basis.lower():
+        parts.append(dispersion)
+        
+    if solvent_model and solvent_model.lower() != "gas":
+        model_name = solvent_model.lower()
+        if solvent_name and solvent_name.strip():
+            parts.append(f"scrf=({model_name},solvent={solvent_name.strip().lower()})")
+        else:
+            parts.append(f"scrf={model_name}")
+            
+    parts.extend([
+        "int=ultrafine",
+        "opt=(tight,calcfc,cartesian,maxstep=5,maxcycles=300)",
+        "freq"
+    ])
+    return " ".join(parts)
+
 @st.cache_data(show_spinner=False)
 def parse_frequency_source(file_bytes, filename):
-    """Read Gaussian frequencies and, when possible, the first imaginary mode."""
+    """Read Gaussian frequencies and, when possible, the first imaginary mode and original route."""
     content = file_bytes.decode("utf-8", errors="replace")
     frequencies = []
     frequency_matches = list(re.finditer(r"Frequencies --\s+([^\n]+)", content))
@@ -50,6 +140,12 @@ def parse_frequency_source(file_bytes, filename):
     normal_termination = "Normal termination of Gaussian" in content
     imaginary = sorted(value for value in frequencies if value < 0)
     mode_frequency, mode_vector, geometry = None, None, None
+
+    # 元の Route section を抽出
+    route_match = re.search(r"-{5,}\n\s*(#[^\n]+(?:\n\s*[^\n-]+)*)\n\s*-{5,}", content)
+    original_route = None
+    if route_match:
+        original_route = " ".join(line.strip() for line in route_match.group(1).splitlines())
 
     # Standard orientation または Input orientation から最適化構造を取得
     orient_pattern = re.compile(
@@ -119,6 +215,7 @@ def parse_frequency_source(file_bytes, filename):
         "mode_frequency": mode_frequency,
         "charge": charge,
         "multiplicity": multiplicity,
+        "original_route": original_route,
     }
 
 def build_displaced_gjf(freq_data, conformer_id, direction, displacement, route, link0):
@@ -137,7 +234,7 @@ def build_displaced_gjf(freq_data, conformer_id, direction, displacement, route,
     if not clean_route.startswith("#"):
         clean_route = "#p " + clean_route
     
-    # ユーザー入力に %chk があっても重複しないように除外
+    # %chkの重複を除外
     lines = [line.strip() for line in link0.splitlines() if line.strip() and not line.strip().lower().startswith("%chk")]
     lines.append(f"%chk={chk_name}")
     lines.extend([
@@ -285,43 +382,93 @@ if energy_files:
             st.subheader("🧭 Phase 1.6: Generate ±-Mode Reoptimization GJFs")
             st.caption("Creates explicit-coordinate inputs from the first detected imaginary mode. These files do not need an old checkpoint.")
             
-            # 計算プリセット辞書（推奨条件と注意書きを明記）
-            ROUTE_PRESETS = {
-                "🌟 [Recommended] wb97xd / 6-311+G(d,p) [PCM: Acetone] (Tight, Cartesian, UltraFine)": 
-                    "#p wb97xd/6-311+g(d,p) scrf=(iefpcm,solvent=acetone) int=ultrafine opt=(tight,calcfc,cartesian,maxstep=5,maxcycles=300) freq",
-                "B3LYP-D3BJ / 6-311+G(d,p) [PCM: Acetone] (Tight, Cartesian, UltraFine)": 
-                    "#p b3lyp/6-311+g(d,p) empiricaldispersion=gd3bj scrf=(iefpcm,solvent=acetone) int=ultrafine opt=(tight,calcfc,cartesian,maxstep=5,maxcycles=300) freq",
-                "M06-2X / def2-TZVP [SMD: Chloroform] (Tight, Cartesian, UltraFine)": 
-                    "#p m062x/def2tzvp scrf=(smd,solvent=chloroform) int=ultrafine opt=(tight,calcfc,cartesian,maxstep=5,maxcycles=300) freq",
-                "⚠️ [Exploration Only] B3LYP / 6-31G(d) [Gas Phase] (Standard Opt - Not for Imag Mode)": 
-                    "#p b3lyp/6-31g(d) opt=(calcfc) freq",
-                "Custom / Blank (自由入力)": ""
-            }
-
-            # 2カラムレイアウト
-            col_route1, col_route2 = st.columns([1, 1])
+            # 元ログから条件を抽出
+            orig_details = parse_route_details(ready_for_restart[0]["frequency"].get("original_route"))
             
-            with col_route1:
-                selected_preset = st.selectbox(
-                    "📋 Calculation Preset",
-                    options=list(ROUTE_PRESETS.keys()),
-                    index=0,
-                    help="Select a preset to fill the route section below, or edit it freely."
-                )
-                preset_route_value = ROUTE_PRESETS[selected_preset]
+            # 3つのセレクターを横並びで配置
+            col_m1, col_m2, col_m3 = st.columns([1.3, 1.0, 1.0])
+            
+            with col_m1:
+                method_options = [
+                    f"✨ [Inherit] {orig_details['method_basis']}",
+                    "🌟 wB97X-D / 6-311+G(d,p)",
+                    "M06-2X / def2-TZVP",
+                    "B3LYP-D3BJ / 6-311+G(d,p)",
+                    "⚠️ B3LYP / 6-31G(d) (Exploration only)",
+                    "Custom (自由入力)"
+                ]
+                sel_method = st.selectbox("1. 汎関数 / 基底関数", options=method_options, index=0)
+                if "Inherit" in sel_method:
+                    active_method = orig_details['method_basis']
+                elif "wB97X-D" in sel_method:
+                    active_method = "wb97xd/6-311+g(d,p)"
+                elif "M06-2X" in sel_method:
+                    active_method = "m062x/def2tzvp"
+                elif "B3LYP-D3BJ" in sel_method:
+                    active_method = "b3lyp/6-311+g(d,p) empiricaldispersion=gd3bj"
+                elif "B3LYP / 6-31G(d)" in sel_method:
+                    active_method = "b3lyp/6-31g(d)"
+                else:
+                    active_method = st.text_input("Method/Basis 手動入力", value=orig_details['method_basis'])
+
+            with col_m2:
+                model_options = [
+                    f"✨ [Inherit] {orig_details['solvent_model'].upper()}" if orig_details['solvent_model'] != 'gas' else "✨ [Inherit] Gas Phase (気相)",
+                    "IEFPCM (scrf=iefpcm)",
+                    "SMD (scrf=smd)",
+                    "PCM (scrf=pcm)",
+                    "None / Gas Phase (気相)"
+                ]
+                sel_model = st.selectbox("2. 溶媒モデル", options=model_options, index=0)
+                if "Inherit" in sel_model:
+                    active_model = orig_details['solvent_model']
+                elif "IEFPCM" in sel_model:
+                    active_model = "iefpcm"
+                elif "SMD" in sel_model:
+                    active_model = "smd"
+                elif "PCM" in sel_model:
+                    active_model = "pcm"
+                else:
+                    active_model = "gas"
+
+            with col_m3:
+                if active_model != "gas":
+                    preset_solvents = ["acetone", "chloroform", "methanol", "dmso", "water", "thf", "acetonitrile", "dichloromethane", "toluene"]
+                    solvent_list = [f"✨ [Inherit] {orig_details['solvent_name']}"] if orig_details['solvent_name'] else []
+                    for s_name in preset_solvents:
+                        if s_name not in solvent_list:
+                            solvent_list.append(s_name)
+                    solvent_list.append("Custom (自由入力)")
+                    
+                    sel_solvent = st.selectbox("3. 溶媒名", options=solvent_list, index=0)
+                    if "Inherit" in sel_solvent:
+                        active_solvent = orig_details['solvent_name'] or "acetone"
+                    elif "Custom" in sel_solvent:
+                        active_solvent = st.text_input("溶媒名 手動入力", value="acetone").strip()
+                    else:
+                        active_solvent = sel_solvent
+                else:
+                    st.selectbox("3. 溶媒名", options=["— (気相: 溶媒なし)"], disabled=True)
+                    active_solvent = ""
+
+            # リアルタイムで Route section を合成
+            composed_route = compose_route(active_method, active_model, active_solvent, orig_details.get("dispersion"))
+
+            # プレビュー表示 & Link 0 設定
+            col_prev1, col_prev2 = st.columns([1.3, 0.9])
+            with col_prev1:
                 restart_route = st.text_area(
-                    "Route section for reoptimization",
-                    value=preset_route_value,
-                    help="Enter or edit the calculation level you intend to use. Do not include %chk here.",
+                    "📝 Reoptimization Route Preview (自動生成・微調整可能)",
+                    value=composed_route,
+                    help="上記で選択された条件から自動構築された Route section です。手動で追記・微調整も可能です。",
                     height=100
                 )
-
-            with col_route2:
+            with col_prev2:
                 restart_link0 = st.text_area(
-                    "Optional Link 0 settings",
+                    "⚙️ Optional Link 0 settings",
                     value="%mem=48GB\n%nprocshared=12",
                     help="One directive per line. %chk is added automatically.",
-                    height=170
+                    height=100
                 )
 
             # 変位スケールと対象配座の選択カラム
