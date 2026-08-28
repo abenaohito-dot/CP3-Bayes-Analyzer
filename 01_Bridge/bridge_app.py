@@ -28,9 +28,9 @@ def parse_energy_source(file_bytes, filename):
     if gibbs_match:
         return {"energy": float(gibbs_match.group(1)), "type": "Gibbs (G)", "filename": filename}
     
-    zpVE_match = re.search(r"Sum of electronic and zero-point Energies=\s+(-?\d+\.\d+)", content)
-    if zpVE_match:
-        return {"energy": float(zpVE_match.group(1)), "type": "ZPVE (E0)", "filename": filename}
+    zpve_match = re.search(r"Sum of electronic and zero-point Energies=\s+(-?\d+\.\d+)", content)
+    if zpve_match:
+        return {"energy": float(zpve_match.group(1)), "type": "ZPVE (E0)", "filename": filename}
     
     scf_matches = re.findall(r"SCF Done:.*?=\s+(-?\d+\.\d+)", content)
     if scf_matches:
@@ -137,7 +137,7 @@ def build_displaced_gjf(freq_data, conformer_id, direction, displacement, route,
     if not clean_route.startswith("#"):
         clean_route = "#p " + clean_route
     
-    # %chkの重複を除外
+    # ユーザー入力に %chk があっても重複しないように除外
     lines = [line.strip() for line in link0.splitlines() if line.strip() and not line.strip().lower().startswith("%chk")]
     lines.append(f"%chk={chk_name}")
     lines.extend([
@@ -158,6 +158,7 @@ def build_displaced_gjf(freq_data, conformer_id, direction, displacement, route,
 def parse_nmr_source_v181(file_bytes, filename):
     """
     Extract Isotropic values and diagonal tensor components (XX, YY, ZZ) safely and quickly.
+    Iterates line by line to avoid Catastrophic Backtracking on large logs.
     """
     content = file_bytes.decode("utf-8", errors="replace")
     lines = content.splitlines()
@@ -243,7 +244,7 @@ with col_up1:
 with col_up2:
     nmr_files = st.file_uploader("Drop NMR files (Shielding)", type=["log", "out"], accept_multiple_files=True)
 
-# OPTファイルがあれば、まず虚振動チェックと再投入GJF生成を有効にする
+# OPTファイルがあれば、まず虚振動チェックと再投入GJF生成を有効化
 if energy_files:
     energy_map = {get_file_id(f.name): parse_energy_source(f.getvalue(), f.name) for f in energy_files if get_file_id(f.name) is not None}
     frequency_map = {get_file_id(f.name): parse_frequency_source(f.getvalue(), f.name) for f in energy_files if get_file_id(f.name) is not None}
@@ -283,23 +284,65 @@ if energy_files:
         if ready_for_restart:
             st.subheader("🧭 Phase 1.6: Generate ±-Mode Reoptimization GJFs")
             st.caption("Creates explicit-coordinate inputs from the first detected imaginary mode. These files do not need an old checkpoint.")
-            restart_route = st.text_area(
-                "Route section for reoptimization",
-                value="",
-                placeholder="#p wb97xd/6-311+g(d,p) scrf=(iefpcm,solvent=acetone) int=ultrafine opt=(tight,calcfc,cartesian,maxstep=5,maxcycles=300) freq",
-                help="Enter the calculation level you intend to use. Do not include %chk here.",
-            )
-            restart_link0 = st.text_area(
-                "Optional Link 0 settings",
-                value="%mem=48GB\n%nprocshared=12",
-                help="One directive per line. %chk is added automatically.",
-            )
-            displacement = st.number_input("Mode displacement scale", min_value=0.01, max_value=1.00, value=0.20, step=0.01, help="0.20 is a gentle starting displacement along the Gaussian-printed normal-mode vector.")
-            restart_ids = st.multiselect(
-                "Conformers to generate",
-                options=[r["id"] for r in ready_for_restart],
-                default=[r["id"] for r in ready_for_restart],
-            )
+            
+            # 計算プリセット辞書（推奨条件と注意書きを明記）
+            ROUTE_PRESETS = {
+                "🌟 [Recommended] wb97xd / 6-311+G(d,p) [PCM: Acetone] (Tight, Cartesian, UltraFine)": 
+                    "#p wb97xd/6-311+g(d,p) scrf=(iefpcm,solvent=acetone) int=ultrafine opt=(tight,calcfc,cartesian,maxstep=5,maxcycles=300) freq",
+                "B3LYP-D3BJ / 6-311+G(d,p) [PCM: Acetone] (Tight, Cartesian, UltraFine)": 
+                    "#p b3lyp/6-311+g(d,p) empiricaldispersion=gd3bj scrf=(iefpcm,solvent=acetone) int=ultrafine opt=(tight,calcfc,cartesian,maxstep=5,maxcycles=300) freq",
+                "M06-2X / def2-TZVP [SMD: Chloroform] (Tight, Cartesian, UltraFine)": 
+                    "#p m062x/def2tzvp scrf=(smd,solvent=chloroform) int=ultrafine opt=(tight,calcfc,cartesian,maxstep=5,maxcycles=300) freq",
+                "⚠️ [Exploration Only] B3LYP / 6-31G(d) [Gas Phase] (Standard Opt - Not for Imag Mode)": 
+                    "#p b3lyp/6-31g(d) opt=(calcfc) freq",
+                "Custom / Blank (自由入力)": ""
+            }
+
+            # 2カラムレイアウト
+            col_route1, col_route2 = st.columns([1, 1])
+            
+            with col_route1:
+                selected_preset = st.selectbox(
+                    "📋 Calculation Preset",
+                    options=list(ROUTE_PRESETS.keys()),
+                    index=0,
+                    help="Select a preset to fill the route section below, or edit it freely."
+                )
+                preset_route_value = ROUTE_PRESETS[selected_preset]
+                restart_route = st.text_area(
+                    "Route section for reoptimization",
+                    value=preset_route_value,
+                    help="Enter or edit the calculation level you intend to use. Do not include %chk here.",
+                    height=100
+                )
+
+            with col_route2:
+                restart_link0 = st.text_area(
+                    "Optional Link 0 settings",
+                    value="%mem=48GB\n%nprocshared=12",
+                    help="One directive per line. %chk is added automatically.",
+                    height=170
+                )
+
+            # 変位スケールと対象配座の選択カラム
+            col_param1, col_param2 = st.columns([1, 2])
+            with col_param1:
+                displacement = st.number_input(
+                    "Mode displacement scale",
+                    min_value=0.01,
+                    max_value=1.00,
+                    value=0.20,
+                    step=0.01,
+                    help="0.20 is a gentle starting displacement along the Gaussian-printed normal-mode vector."
+                )
+            with col_param2:
+                restart_ids = st.multiselect(
+                    "Conformers to generate",
+                    options=[r["id"] for r in ready_for_restart],
+                    default=[r["id"] for r in ready_for_restart],
+                )
+
+            # GJF 生成 & ZIP ダウンロード
             if restart_route.strip() and restart_ids:
                 zip_buffer = BytesIO()
                 with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as archive:
@@ -309,15 +352,26 @@ if energy_files:
                         mode_label = f"{abs(result['frequency']['mode_frequency']):.2f}".replace(".", "p")
                         for direction in ("plus", "minus"):
                             filename = f"conf_{result['id']}_imag{mode_label}_{direction}.gjf"
-                            archive.writestr(filename, build_displaced_gjf(result["frequency"], result["id"], direction, displacement, restart_route, restart_link0))
+                            archive.writestr(
+                                filename,
+                                build_displaced_gjf(
+                                    result["frequency"],
+                                    result["id"],
+                                    direction,
+                                    displacement,
+                                    restart_route,
+                                    restart_link0
+                                )
+                            )
                 st.download_button(
                     "💾 Download ±-Mode Reoptimization GJFs (ZIP)",
                     data=zip_buffer.getvalue(),
                     file_name="imaginary_mode_reoptimization_inputs.zip",
                     mime="application/zip",
+                    use_container_width=True
                 )
-            elif ready_for_restart:
-                st.info("Enter a route section to enable GJF generation.")
+            elif not restart_route.strip():
+                st.info("Enter or select a route section to enable GJF generation.")
 
         imaginary_ids = [r["id"] for r in opt_results if r["frequency"]["imaginary"]]
         if imaginary_ids:
