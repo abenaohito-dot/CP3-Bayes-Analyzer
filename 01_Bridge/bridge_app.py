@@ -30,6 +30,34 @@ def parse_energy_source(file_content, filename):
         return {"energy": float(scf_matches[-1]), "type": "SCF (E)", "filename": filename}
     return None
 
+def parse_frequency_source(file_content, filename):
+    """Read Gaussian frequency blocks and report imaginary vibrational modes."""
+    content = file_content.decode("utf-8", errors="replace")
+    frequencies = []
+    for line in content.splitlines():
+        if "Frequencies --" in line:
+            frequencies.extend(float(value) for value in re.findall(r"-?\d+\.\d+", line))
+
+    normal_termination = "Normal termination of Gaussian" in content
+    imaginary = sorted(value for value in frequencies if value < 0)
+    if not frequencies:
+        status = "⚪ Frequency data not found"
+    elif not normal_termination:
+        status = "⚪ Calculation not completed"
+    elif not imaginary:
+        status = "✅ No imaginary frequency"
+    elif max(abs(value) for value in imaginary) <= 20.0:
+        status = "⚠️ Soft imaginary frequency (≤20 cm⁻¹)"
+    else:
+        status = "❌ Imaginary frequency detected (>20 cm⁻¹)"
+
+    return {
+        "filename": filename,
+        "normal_termination": normal_termination,
+        "imaginary": imaginary,
+        "status": status,
+    }
+
 def parse_nmr_source_v181(file_content, filename):
     """Extract Isotropic values and diagonal tensor components (XX, YY, ZZ)."""
     content = file_content.decode("utf-8")
@@ -65,8 +93,8 @@ def natural_sort_key(s):
     return [int(t) if t.isdigit() else t.lower() for t in re.split('([0-9]+)', str(s))]
 
 # --- UI Setup ---
-st.set_page_config(page_title="NMR DATA BRIDGE v1.8.1", layout="wide")
-st.title("🌉 NMR DATA BRIDGE Ver. 1.8.1")
+st.set_page_config(page_title="NMR DATA BRIDGE v1.8.2", layout="wide")
+st.title("🌉 NMR DATA BRIDGE Ver. 1.8.2")
 st.markdown("##### *Professional Output Mode - Gifu Pharm. Univ. Abe-lab*")
 
 # Session State
@@ -89,6 +117,7 @@ with col_up2:
 
 if energy_files and nmr_files:
     energy_map = {get_file_id(f.name): parse_energy_source(f.getvalue(), f.name) for f in energy_files if get_file_id(f.name) is not None}
+    frequency_map = {get_file_id(f.name): parse_frequency_source(f.getvalue(), f.name) for f in energy_files if get_file_id(f.name) is not None}
     matched_results = []
     for f in nmr_files:
         fid = get_file_id(f.name)
@@ -96,10 +125,43 @@ if energy_files and nmr_files:
         if parsed_nmr and fid in energy_map and energy_map[fid]:
             matched_results.append({
                 "id": fid, "filename_nmr": f.name, "filename_energy": energy_map[fid]["filename"],
-                "energy": energy_map[fid]["energy"], "energy_type": energy_map[fid]["type"], "atoms": parsed_nmr["atoms"]
+                "energy": energy_map[fid]["energy"], "energy_type": energy_map[fid]["type"], "atoms": parsed_nmr["atoms"],
+                "frequency": frequency_map[fid]
             })
 
     if matched_results:
+        # 1.5 Frequency / imaginary-mode check (shown before Boltzmann averaging)
+        st.subheader("🫨 Phase 1.5: Frequency Check")
+        freq_df = pd.DataFrame({
+            "ID": [r["id"] for r in matched_results],
+            "Energy File": [r["filename_energy"] for r in matched_results],
+            "Normal Termination": ["Yes" if r["frequency"]["normal_termination"] else "No" for r in matched_results],
+            "Imaginary Modes": [len(r["frequency"]["imaginary"]) for r in matched_results],
+            "Imaginary Frequencies (cm⁻¹)": [", ".join(f"{v:.2f}" for v in r["frequency"]["imaginary"]) or "—" for r in matched_results],
+            "Frequency Status": [r["frequency"]["status"] for r in matched_results],
+        }).sort_values("ID")
+        st.dataframe(freq_df, use_container_width=True)
+        st.download_button(
+            "💾 Download Frequency Check CSV",
+            data=freq_df.to_csv(index=False).encode("utf-8"),
+            file_name="Gaussian_Frequency_Check.csv",
+            use_container_width=False,
+        )
+
+        imaginary_ids = [r["id"] for r in matched_results if r["frequency"]["imaginary"]]
+        if imaginary_ids:
+            st.warning(f"Imaginary frequency detected in conformer(s): {', '.join(map(str, imaginary_ids))}. Review before interpreting Boltzmann populations.")
+        exclude_imaginary = st.checkbox(
+            "Exclude conformers with any imaginary frequency from Boltzmann averaging",
+            value=False,
+            help="Off by default: inspect the table first. Enable only when you decide those structures should not enter the ensemble.",
+        )
+        if exclude_imaginary:
+            matched_results = [r for r in matched_results if not r["frequency"]["imaginary"]]
+            if not matched_results:
+                st.error("No conformers remain after excluding imaginary-frequency structures.")
+                st.stop()
+
         # 2. Boltzmann Summary
         energies = [r['energy'] for r in matched_results]
         min_e = min(energies)
