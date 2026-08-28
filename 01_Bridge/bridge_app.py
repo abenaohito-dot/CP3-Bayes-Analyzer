@@ -3,6 +3,8 @@ import pandas as pd
 import numpy as np
 import re
 import math
+import zipfile
+from io import BytesIO
 
 # --- Constants ---
 KB_KCAL = 1.9872e-3
@@ -26,9 +28,9 @@ def parse_energy_source(file_bytes, filename):
     if gibbs_match:
         return {"energy": float(gibbs_match.group(1)), "type": "Gibbs (G)", "filename": filename}
     
-    zpve_match = re.search(r"Sum of electronic and zero-point Energies=\s+(-?\d+\.\d+)", content)
-    if zpve_match:
-        return {"energy": float(zpve_match.group(1)), "type": "ZPVE (E0)", "filename": filename}
+    zpVE_match = re.search(r"Sum of electronic and zero-point Energies=\s+(-?\d+\.\d+)", content)
+    if zpVE_match:
+        return {"energy": float(zpVE_match.group(1)), "type": "ZPVE (E0)", "filename": filename}
     
     scf_matches = re.findall(r"SCF Done:.*?=\s+(-?\d+\.\d+)", content)
     if scf_matches:
@@ -38,15 +40,64 @@ def parse_energy_source(file_bytes, filename):
 
 @st.cache_data(show_spinner=False)
 def parse_frequency_source(file_bytes, filename):
-    """Read Gaussian frequency blocks and report imaginary vibrational modes."""
+    """Read Gaussian frequencies and, when possible, the first imaginary mode."""
     content = file_bytes.decode("utf-8", errors="replace")
     frequencies = []
-    for line in content.splitlines():
-        if "Frequencies --" in line:
-            frequencies.extend(float(value) for value in re.findall(r"-?\d+\.\d+", line))
+    frequency_matches = list(re.finditer(r"Frequencies --\s+([^\n]+)", content))
+    for match in frequency_matches:
+        frequencies.extend(float(value) for value in re.findall(r"-?\d+\.\d+", match.group(1)))
 
     normal_termination = "Normal termination of Gaussian" in content
     imaginary = sorted(value for value in frequencies if value < 0)
+    mode_frequency, mode_vector, geometry = None, None, None
+
+    # Standard orientation または Input orientation から最適化構造を取得
+    orient_pattern = re.compile(
+        r"(?:Standard|Input)\s+orientation:\s*\n\s*-+\s*\n\s*Center\s+Atomic\s+Atomic\s+Coordinates \(Angstroms\)\s*\n"
+        r"\s*Number\s+Number\s+Type\s+X\s+Y\s+Z\s*\n\s*-+\s*\n(.*?)\n\s*-+",
+        re.DOTALL,
+    )
+    orientation_blocks = orient_pattern.findall(content)
+    if orientation_blocks:
+        parsed_geometry = []
+        for row in orientation_blocks[-1].splitlines():
+            fields = row.split()
+            if len(fields) >= 6 and fields[0].isdigit() and fields[1].isdigit():
+                parsed_geometry.append((int(fields[1]), float(fields[3]), float(fields[4]), float(fields[5])))
+        geometry = parsed_geometry or None
+
+    # 第一虚振動の変位ベクトルを取得
+    if geometry and imaginary:
+        for freq_match in frequency_matches:
+            block_frequencies = [float(value) for value in re.findall(r"-?\d+\.\d+", freq_match.group(1))]
+            for mode_column, value in enumerate(block_frequencies):
+                if value >= 0:
+                    continue
+                following_lines = content[freq_match.end():].splitlines()
+                header_index = next((i for i, line in enumerate(following_lines[:40]) if re.search(r"Atom\s+AN\s+X\s+Y\s+Z", line)), None)
+                if header_index is None:
+                    continue
+                vectors = []
+                for line in following_lines[header_index + 1:]:
+                    fields = line.split()
+                    if len(fields) < 2 + (mode_column + 1) * 3 or not fields[0].isdigit() or not fields[1].isdigit():
+                        if vectors:
+                            break
+                        continue
+                    try:
+                        xyz = [float(number) for number in fields[2 + 3 * mode_column: 5 + 3 * mode_column]]
+                    except ValueError:
+                        continue
+                    vectors.append((int(fields[1]), *xyz))
+                if len(vectors) == len(geometry) and [row[0] for row in vectors] == [row[0] for row in geometry]:
+                    mode_frequency, mode_vector = value, vectors
+                    break
+            if mode_vector:
+                break
+
+    charge_matches = re.findall(r"Charge\s*=\s*(-?\d+)\s+Multiplicity\s*=\s*(\d+)", content)
+    charge, multiplicity = (int(charge_matches[-1][0]), int(charge_matches[-1][1])) if charge_matches else (0, 1)
+    
     if not frequencies:
         status = "⚪ Frequency data not found"
     elif not normal_termination:
@@ -63,20 +114,55 @@ def parse_frequency_source(file_bytes, filename):
         "normal_termination": normal_termination,
         "imaginary": imaginary,
         "status": status,
+        "geometry": geometry,
+        "mode_vector": mode_vector,
+        "mode_frequency": mode_frequency,
+        "charge": charge,
+        "multiplicity": multiplicity,
     }
+
+def build_displaced_gjf(freq_data, conformer_id, direction, displacement, route, link0):
+    """Generate an explicit-coordinate reoptimization input; no old checkpoint is required."""
+    element_symbols = {
+        1: "H", 2: "He", 3: "Li", 4: "Be", 5: "B", 6: "C", 7: "N", 8: "O", 9: "F", 10: "Ne",
+        11: "Na", 12: "Mg", 13: "Al", 14: "Si", 15: "P", 16: "S", 17: "Cl", 18: "Ar",
+        19: "K", 20: "Ca", 26: "Fe", 27: "Co", 28: "Ni", 29: "Cu", 30: "Zn", 34: "Se", 35: "Br", 53: "I"
+    }
+    sign = 1.0 if direction == "plus" else -1.0
+    safe_id = re.sub(r"[^A-Za-z0-9_-]", "_", str(conformer_id))
+    mode_label = f"{abs(freq_data['mode_frequency']):.2f}".replace(".", "p")
+    chk_name = f"conf_{safe_id}_imag{mode_label}_{direction}.chk"
+    
+    clean_route = " ".join(route.split())
+    if not clean_route.startswith("#"):
+        clean_route = "#p " + clean_route
+    
+    # %chkの重複を除外
+    lines = [line.strip() for line in link0.splitlines() if line.strip() and not line.strip().lower().startswith("%chk")]
+    lines.append(f"%chk={chk_name}")
+    lines.extend([
+        clean_route,
+        "",
+        f"Conformer {conformer_id}: {direction} displacement along {freq_data['mode_frequency']:.4f} cm-1",
+        "",
+        f"{freq_data['charge']} {freq_data['multiplicity']}"
+    ])
+    
+    for (atomic_no, x, y, z), (_, vx, vy, vz) in zip(freq_data["geometry"], freq_data["mode_vector"]):
+        symbol = element_symbols.get(atomic_no, str(atomic_no))
+        lines.append(f"{symbol:<2} {x + sign * displacement * vx: .8f} {y + sign * displacement * vy: .8f} {z + sign * displacement * vz: .8f}")
+    
+    return "\n".join(lines) + "\n\n"
 
 @st.cache_data(show_spinner=False)
 def parse_nmr_source_v181(file_bytes, filename):
     """
     Extract Isotropic values and diagonal tensor components (XX, YY, ZZ) safely and quickly.
-    Iterates line by line to avoid Catastrophic Backtracking on large logs.
     """
     content = file_bytes.decode("utf-8", errors="replace")
     lines = content.splitlines()
     
     atoms = []
-    
-    # 正規表現を行単位で適用（爆発的なバックトラックを防ぐ）
     iso_pattern = re.compile(r"^\s*(\d+)\s+([A-Za-z]+)\s+Isotropic\s*=\s*(-?\d+\.\d+)")
     xx_pattern = re.compile(r"XX=\s*(-?\d+\.\d+)")
     yy_pattern = re.compile(r"YY=\s*(-?\d+\.\d+)")
@@ -92,7 +178,6 @@ def parse_nmr_source_v181(file_bytes, filename):
             element = iso_m.group(2)
             sigma = float(iso_m.group(3))
             
-            # XX, YY, ZZ は通常、直後の行（1〜3行以内）に出現する
             xx, yy, zz = None, None, None
             for offset in range(1, 5):
                 if i + offset >= n:
@@ -108,7 +193,6 @@ def parse_nmr_source_v181(file_bytes, filename):
                     zz_m = zz_pattern.search(subline)
                     if zz_m: zz = float(zz_m.group(1))
                 
-                # 次の原子の行に達した場合は抜ける
                 if iso_pattern.search(subline):
                     break
             
@@ -137,8 +221,8 @@ def natural_sort_key(s):
     return [int(t) if t.isdigit() else t.lower() for t in re.split(r'([0-9]+)', str(s))]
 
 # --- UI Setup ---
-st.set_page_config(page_title="NMR DATA BRIDGE v1.8.2", layout="wide")
-st.title("🌉 NMR DATA BRIDGE Ver. 1.8.2")
+st.set_page_config(page_title="NMR DATA BRIDGE v2.0", layout="wide")
+st.title("🌉 NMR DATA BRIDGE Ver. 2.0")
 st.markdown("##### *Professional Output Mode - Gifu Pharm. Univ. Abe-lab*")
 
 # Session State
@@ -159,31 +243,32 @@ with col_up1:
 with col_up2:
     nmr_files = st.file_uploader("Drop NMR files (Shielding)", type=["log", "out"], accept_multiple_files=True)
 
-if energy_files and nmr_files:
+# OPTファイルがあれば、まず虚振動チェックと再投入GJF生成を有効にする
+if energy_files:
     energy_map = {get_file_id(f.name): parse_energy_source(f.getvalue(), f.name) for f in energy_files if get_file_id(f.name) is not None}
     frequency_map = {get_file_id(f.name): parse_frequency_source(f.getvalue(), f.name) for f in energy_files if get_file_id(f.name) is not None}
-    matched_results = []
     
-    for f in nmr_files:
-        fid = get_file_id(f.name)
-        parsed_nmr = parse_nmr_source_v181(f.getvalue(), f.name)
-        if parsed_nmr and fid in energy_map and energy_map[fid]:
-            matched_results.append({
-                "id": fid, "filename_nmr": f.name, "filename_energy": energy_map[fid]["filename"],
-                "energy": energy_map[fid]["energy"], "energy_type": energy_map[fid]["type"], "atoms": parsed_nmr["atoms"],
-                "frequency": frequency_map[fid]
+    opt_results = []
+    for fid, freq in frequency_map.items():
+        if fid in energy_map and energy_map[fid]:
+            opt_results.append({
+                "id": fid,
+                "filename_energy": energy_map[fid]["filename"],
+                "energy": energy_map[fid]["energy"],
+                "energy_type": energy_map[fid]["type"],
+                "frequency": freq,
             })
 
-    if matched_results:
-        # 1.5 Frequency / imaginary-mode check
+    if opt_results:
+        # 1.5 Frequency / imaginary-mode check (OPTファイルのみで動作)
         st.subheader("🫨 Phase 1.5: Frequency Check")
         freq_df = pd.DataFrame({
-            "ID": [r["id"] for r in matched_results],
-            "Energy File": [r["filename_energy"] for r in matched_results],
-            "Normal Termination": ["Yes" if r["frequency"]["normal_termination"] else "No" for r in matched_results],
-            "Imaginary Modes": [len(r["frequency"]["imaginary"]) for r in matched_results],
-            "Imaginary Frequencies (cm⁻¹)": [", ".join(f"{v:.2f}" for v in r["frequency"]["imaginary"]) or "—" for r in matched_results],
-            "Frequency Status": [r["frequency"]["status"] for r in matched_results],
+            "ID": [r["id"] for r in opt_results],
+            "Energy File": [r["filename_energy"] for r in opt_results],
+            "Normal Termination": ["Yes" if r["frequency"]["normal_termination"] else "No" for r in opt_results],
+            "Imaginary Modes": [len(r["frequency"]["imaginary"]) for r in opt_results],
+            "Imaginary Frequencies (cm⁻¹)": [", ".join(f"{v:.2f}" for v in r["frequency"]["imaginary"]) or "—" for r in opt_results],
+            "Frequency Status": [r["frequency"]["status"] for r in opt_results],
         }).sort_values("ID")
         st.dataframe(freq_df, use_container_width=True)
         st.download_button(
@@ -193,7 +278,48 @@ if energy_files and nmr_files:
             use_container_width=False,
         )
 
-        imaginary_ids = [r["id"] for r in matched_results if r["frequency"]["imaginary"]]
+        # 1.6 Generate +/- displaced reoptimization inputs (OPTファイルのみで動作)
+        ready_for_restart = [r for r in opt_results if r["frequency"]["mode_vector"]]
+        if ready_for_restart:
+            st.subheader("🧭 Phase 1.6: Generate ±-Mode Reoptimization GJFs")
+            st.caption("Creates explicit-coordinate inputs from the first detected imaginary mode. These files do not need an old checkpoint.")
+            restart_route = st.text_area(
+                "Route section for reoptimization",
+                value="",
+                placeholder="#p wb97xd/6-311+g(d,p) scrf=(iefpcm,solvent=acetone) int=ultrafine opt=(tight,calcfc,cartesian,maxstep=5,maxcycles=300) freq",
+                help="Enter the calculation level you intend to use. Do not include %chk here.",
+            )
+            restart_link0 = st.text_area(
+                "Optional Link 0 settings",
+                value="%mem=48GB\n%nprocshared=12",
+                help="One directive per line. %chk is added automatically.",
+            )
+            displacement = st.number_input("Mode displacement scale", min_value=0.01, max_value=1.00, value=0.20, step=0.01, help="0.20 is a gentle starting displacement along the Gaussian-printed normal-mode vector.")
+            restart_ids = st.multiselect(
+                "Conformers to generate",
+                options=[r["id"] for r in ready_for_restart],
+                default=[r["id"] for r in ready_for_restart],
+            )
+            if restart_route.strip() and restart_ids:
+                zip_buffer = BytesIO()
+                with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+                    for result in ready_for_restart:
+                        if result["id"] not in restart_ids:
+                            continue
+                        mode_label = f"{abs(result['frequency']['mode_frequency']):.2f}".replace(".", "p")
+                        for direction in ("plus", "minus"):
+                            filename = f"conf_{result['id']}_imag{mode_label}_{direction}.gjf"
+                            archive.writestr(filename, build_displaced_gjf(result["frequency"], result["id"], direction, displacement, restart_route, restart_link0))
+                st.download_button(
+                    "💾 Download ±-Mode Reoptimization GJFs (ZIP)",
+                    data=zip_buffer.getvalue(),
+                    file_name="imaginary_mode_reoptimization_inputs.zip",
+                    mime="application/zip",
+                )
+            elif ready_for_restart:
+                st.info("Enter a route section to enable GJF generation.")
+
+        imaginary_ids = [r["id"] for r in opt_results if r["frequency"]["imaginary"]]
         if imaginary_ids:
             st.warning(f"Imaginary frequency detected in conformer(s): {', '.join(map(str, imaginary_ids))}. Review before interpreting Boltzmann populations.")
         exclude_imaginary = st.checkbox(
@@ -201,92 +327,109 @@ if energy_files and nmr_files:
             value=False,
             help="Off by default: inspect the table first. Enable only when you decide those structures should not enter the ensemble.",
         )
-        if exclude_imaginary:
-            matched_results = [r for r in matched_results if not r["frequency"]["imaginary"]]
-            if not matched_results:
-                st.error("No conformers remain after excluding imaginary-frequency structures.")
-                st.stop()
 
-        # 2. Boltzmann Summary
-        energies = [r['energy'] for r in matched_results]
-        min_e = min(energies)
-        kb_t = KB_KCAL * temp / HARTREE_TO_KCAL
-        weights = [math.exp(-(e - min_e) / kb_t) for e in energies]
-        final_w = [w / sum(weights) for w in weights]
+        # --- Phase 2 以降: NMRファイルもアップロードされた場合に実行 ---
+        if nmr_files:
+            matched_results = []
+            for f in nmr_files:
+                fid = get_file_id(f.name)
+                parsed_nmr = parse_nmr_source_v181(f.getvalue(), f.name)
+                if parsed_nmr and fid in energy_map and energy_map[fid]:
+                    matched_results.append({
+                        "id": fid, "filename_nmr": f.name, "filename_energy": energy_map[fid]["filename"],
+                        "energy": energy_map[fid]["energy"], "energy_type": energy_map[fid]["type"], "atoms": parsed_nmr["atoms"],
+                        "frequency": frequency_map[fid]
+                    })
 
-        st.subheader("📊 Phase 2: Boltzmann Summary")
-        dist_df = pd.DataFrame({
-            "ID": [r['id'] for r in matched_results],
-            "Energy File": [r['filename_energy'] for r in matched_results],
-            "NMR File": [r['filename_nmr'] for r in matched_results],
-            "Energy Type": [r['energy_type'] for r in matched_results],
-            "Rel. E (kcal/mol)": [(e - min_e) * HARTREE_TO_KCAL for e in energies],
-            "Weight (%)": [w * 100 for w in final_w]
-        }).sort_values("ID")
-        st.dataframe(dist_df.style.format(subset=["Rel. E (kcal/mol)", "Weight (%)"], formatter="{:.2f}"), use_container_width=True)
+            if matched_results:
+                if exclude_imaginary:
+                    matched_results = [r for r in matched_results if not r["frequency"]["imaginary"]]
+                    if not matched_results:
+                        st.error("No conformers remain after excluding imaginary-frequency structures.")
+                        st.stop()
 
-        # --- Phase 2.5: Raw Data Verification ---
-        st.subheader("🔍 Phase 2.5: Raw Data Verification (All Conformers)")
-        raw_rows = []
-        for r in matched_results:
-            for atom in r['atoms']:
-                raw_rows.append({
-                    "Conf_ID": r['id'],
-                    "Atom_No": atom['index'],
-                    "Element": atom['element'],
-                    "Isotropic": atom['sigma'],
-                    "XX": atom['XX'], "YY": atom['YY'], "ZZ": atom['ZZ']
-                })
-        raw_df = pd.DataFrame(raw_rows)
-        st.write("Raw shielding constants and tensor components extracted from each conformer:")
-        st.dataframe(raw_df, use_container_width=True)
-        
-        st.download_button(
-            "💾 Download Raw Tensors CSV",
-            data=raw_df.to_csv(index=False).encode('utf-8'),
-            file_name="NMR_Raw_Tensors_Check.csv",
-            use_container_width=False
-        )
+                # 2. Boltzmann Summary
+                energies = [r['energy'] for r in matched_results]
+                min_e = min(energies)
+                kb_t = KB_KCAL * temp / HARTREE_TO_KCAL
+                weights = [math.exp(-(e - min_e) / kb_t) for e in energies]
+                final_w = [w / sum(weights) for w in weights]
 
-        # 3. Atomic Labeling
-        st.subheader("🏷️ Phase 3: Atom Labeling & Averaging")
-        base_atoms = matched_results[0]['atoms']
-        atom_data = []
-        for i in range(len(base_atoms)):
-            avg_s = sum(r['atoms'][i]['sigma'] * final_w[idx] for idx, r in enumerate(matched_results))
-            atom_data.append({"Atom_No": base_atoms[i]['index'], "Element": base_atoms[i]['element'], "Avg_Shielding": avg_s, "Atom_Label": ""})
-        
-        edited_df = st.data_editor(pd.DataFrame(atom_data), hide_index=True, use_container_width=True, key="editor")
+                st.subheader("📊 Phase 2: Boltzmann Summary")
+                dist_df = pd.DataFrame({
+                    "ID": [r['id'] for r in matched_results],
+                    "Energy File": [r['filename_energy'] for r in matched_results],
+                    "NMR File": [r['filename_nmr'] for r in matched_results],
+                    "Energy Type": [r['energy_type'] for r in matched_results],
+                    "Rel. E (kcal/mol)": [(e - min_e) * HARTREE_TO_KCAL for e in energies],
+                    "Weight (%)": [w * 100 for w in final_w]
+                }).sort_values("ID")
+                st.dataframe(dist_df.style.format(subset=["Rel. E (kcal/mol)", "Weight (%)"], formatter="{:.2f}"), use_container_width=True)
 
-        # 4. Export
-        st.divider()
-        st.subheader("🚀 Phase 4: Data Integration & Export")
-        col_a, col_b = st.columns(2)
+                # --- Phase 2.5: Raw Data Verification ---
+                st.subheader("🔍 Phase 2.5: Raw Data Verification (All Conformers)")
+                raw_rows = []
+                for r in matched_results:
+                    for atom in r['atoms']:
+                        raw_rows.append({
+                            "Conf_ID": r['id'],
+                            "Atom_No": atom['index'],
+                            "Element": atom['element'],
+                            "Isotropic": atom['sigma'],
+                            "XX": atom['XX'], "YY": atom['YY'], "ZZ": atom['ZZ']
+                        })
+                raw_df = pd.DataFrame(raw_rows)
+                st.write("Raw shielding constants and tensor components extracted from each conformer:")
+                st.dataframe(raw_df, use_container_width=True)
+                
+                st.download_button(
+                    "💾 Download Raw Tensors CSV",
+                    data=raw_df.to_csv(index=False).encode('utf-8'),
+                    file_name="NMR_Raw_Tensors_Check.csv",
+                    use_container_width=False
+                )
 
-        with col_a:
-            st.markdown("##### **[Analysis Mode]**")
-            if st.button("Prepare Analysis Data", use_container_width=True):
-                df_labeled = edited_df[edited_df['Atom_Label'] != ""].copy()
-                if not df_labeled.empty:
-                    df_labeled['Atom_Label'] = df_labeled['Atom_Label'].apply(lambda x: auto_pad_label(x, "", ""))
-                    res = df_labeled.groupby('Atom_Label')['Avg_Shielding'].mean().reset_index().rename(columns={'Avg_Shielding': 'Calc_Raw'})
-                    st.session_state.data_analysis = res.sort_values(by='Atom_Label', key=lambda x: x.map(natural_sort_key))
-                    st.session_state.processed_analysis = True
+                # 3. Atomic Labeling
+                st.subheader("🏷️ Phase 3: Atom Labeling & Averaging")
+                base_atoms = matched_results[0]['atoms']
+                atom_data = []
+                for i in range(len(base_atoms)):
+                    avg_s = sum(r['atoms'][i]['sigma'] * final_w[idx] for idx, r in enumerate(matched_results))
+                    atom_data.append({"Atom_No": base_atoms[i]['index'], "Element": base_atoms[i]['element'], "Avg_Shielding": avg_s, "Atom_Label": ""})
+                
+                edited_df = st.data_editor(pd.DataFrame(atom_data), hide_index=True, use_container_width=True, key="editor")
 
-            if st.session_state.processed_analysis:
-                st.download_button("💾 Download Analysis CSV", data=st.session_state.data_analysis.to_csv(index=False).encode('utf-8'), file_name="Calc_Data_Analysis.csv", use_container_width=True)
+                # 4. Export
+                st.divider()
+                st.subheader("🚀 Phase 4: Data Integration & Export")
+                col_a, col_b = st.columns(2)
 
-        with col_b:
-            st.markdown("##### **[Backup Mode]**")
-            if st.button("Prepare Backup Data", use_container_width=True):
-                df_all = edited_df.copy()
-                df_all['Atom_Label'] = df_all.apply(lambda x: auto_pad_label(x['Atom_Label'], x['Element'], x['Atom_No']), axis=1)
-                res_all = df_all.groupby('Atom_Label')['Avg_Shielding'].mean().reset_index().rename(columns={'Avg_Shielding': 'Calc_Raw'})
-                st.session_state.data_backup = res_all.sort_values(by='Atom_Label', key=lambda x: x.map(natural_sort_key))
-                st.session_state.processed_backup = True
+                with col_a:
+                    st.markdown("##### **[Analysis Mode]**")
+                    if st.button("Prepare Analysis Data", use_container_width=True):
+                        df_labeled = edited_df[edited_df['Atom_Label'] != ""].copy()
+                        if not df_labeled.empty:
+                            df_labeled['Atom_Label'] = df_labeled['Atom_Label'].apply(lambda x: auto_pad_label(x, "", ""))
+                            res = df_labeled.groupby('Atom_Label')['Avg_Shielding'].mean().reset_index().rename(columns={'Avg_Shielding': 'Calc_Raw'})
+                            st.session_state.data_analysis = res.sort_values(by='Atom_Label', key=lambda x: x.map(natural_sort_key))
+                            st.session_state.processed_analysis = True
 
-            if st.session_state.processed_backup:
-                st.download_button("💾 Download Backup CSV", data=st.session_state.data_backup.to_csv(index=False).encode('utf-8'), file_name="Calc_Data_Full_Backup.csv", use_container_width=True)
+                    if st.session_state.processed_analysis:
+                        st.download_button("💾 Download Analysis CSV", data=st.session_state.data_analysis.to_csv(index=False).encode('utf-8'), file_name="Calc_Data_Analysis.csv", use_container_width=True)
 
-elif (energy_files or nmr_files):
-    st.info("Awaiting both OPT and NMR files to enable verification and export functions.")
+                with col_b:
+                    st.markdown("##### **[Backup Mode]**")
+                    if st.button("Prepare Backup Data", use_container_width=True):
+                        df_all = edited_df.copy()
+                        df_all['Atom_Label'] = df_all.apply(lambda x: auto_pad_label(x['Atom_Label'], x['Element'], x['Atom_No']), axis=1)
+                        res_all = df_all.groupby('Atom_Label')['Avg_Shielding'].mean().reset_index().rename(columns={'Avg_Shielding': 'Calc_Raw'})
+                        st.session_state.data_backup = res_all.sort_values(by='Atom_Label', key=lambda x: x.map(natural_sort_key))
+                        st.session_state.processed_backup = True
+
+                    if st.session_state.processed_backup:
+                        st.download_button("💾 Download Backup CSV", data=st.session_state.data_backup.to_csv(index=False).encode('utf-8'), file_name="Calc_Data_Full_Backup.csv", use_container_width=True)
+        else:
+            st.info("💡 Awaiting NMR files (Drop NMR files in Phase 1) to enable Boltzmann averaging and shielding integration.")
+
+elif nmr_files:
+    st.info("Awaiting OPT files to extract energies and conformer geometries.")
