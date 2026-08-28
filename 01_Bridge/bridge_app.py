@@ -9,7 +9,7 @@ KB_KCAL = 1.9872e-3
 HARTREE_TO_KCAL = 627.509
 TEMP_DEFAULT = 298.15
 
-# --- Helper Functions ---
+# --- Helper Functions (with @st.cache_data) ---
 
 def get_file_id(filename):
     """Extract the last integer from filename before extension."""
@@ -17,22 +17,29 @@ def get_file_id(filename):
     nums = re.findall(r'(\d+)', name_part)
     return int(nums[-1]) if nums else None
 
-def parse_energy_source(file_content, filename):
-    content = file_content.decode("utf-8")
+@st.cache_data(show_spinner=False)
+def parse_energy_source(file_bytes, filename):
+    """Parse energy from Gaussian log file bytes."""
+    content = file_bytes.decode("utf-8", errors="replace")
+    
     gibbs_match = re.search(r"Sum of electronic and thermal Free Energies=\s+(-?\d+\.\d+)", content)
     if gibbs_match:
         return {"energy": float(gibbs_match.group(1)), "type": "Gibbs (G)", "filename": filename}
+    
     zpve_match = re.search(r"Sum of electronic and zero-point Energies=\s+(-?\d+\.\d+)", content)
     if zpve_match:
         return {"energy": float(zpve_match.group(1)), "type": "ZPVE (E0)", "filename": filename}
+    
     scf_matches = re.findall(r"SCF Done:.*?=\s+(-?\d+\.\d+)", content)
     if scf_matches:
         return {"energy": float(scf_matches[-1]), "type": "SCF (E)", "filename": filename}
+    
     return None
 
-def parse_frequency_source(file_content, filename):
+@st.cache_data(show_spinner=False)
+def parse_frequency_source(file_bytes, filename):
     """Read Gaussian frequency blocks and report imaginary vibrational modes."""
-    content = file_content.decode("utf-8", errors="replace")
+    content = file_bytes.decode("utf-8", errors="replace")
     frequencies = []
     for line in content.splitlines():
         if "Frequencies --" in line:
@@ -58,39 +65,76 @@ def parse_frequency_source(file_content, filename):
         "status": status,
     }
 
-def parse_nmr_source_v181(file_content, filename):
-    """Extract Isotropic values and diagonal tensor components (XX, YY, ZZ)."""
-    content = file_content.decode("utf-8")
-    nmr_pattern = re.compile(
-        r"(\d+)\s+([A-Za-z]+)\s+Isotropic =\s+(-?\d+\.\d+).*?"
-        r"XX=\s+(-?\d+\.\d+).*?"
-        r"YY=\s+(-?\d+\.\d+).*?"
-        r"ZZ=\s+(-?\d+\.\d+)", 
-        re.DOTALL
-    )
+@st.cache_data(show_spinner=False)
+def parse_nmr_source_v181(file_bytes, filename):
+    """
+    Extract Isotropic values and diagonal tensor components (XX, YY, ZZ) safely and quickly.
+    Iterates line by line to avoid Catastrophic Backtracking on large logs.
+    """
+    content = file_bytes.decode("utf-8", errors="replace")
+    lines = content.splitlines()
     
     atoms = []
-    for m in nmr_pattern.findall(content):
-        atoms.append({
-            "index": int(m[0]), 
-            "element": m[1], 
-            "sigma": float(m[2]),
-            "XX": float(m[3]),
-            "YY": float(m[4]),
-            "ZZ": float(m[5])
-        })
+    
+    # 正規表現を行単位で適用（爆発的なバックトラックを防ぐ）
+    iso_pattern = re.compile(r"^\s*(\d+)\s+([A-Za-z]+)\s+Isotropic\s*=\s*(-?\d+\.\d+)")
+    xx_pattern = re.compile(r"XX=\s*(-?\d+\.\d+)")
+    yy_pattern = re.compile(r"YY=\s*(-?\d+\.\d+)")
+    zz_pattern = re.compile(r"ZZ=\s*(-?\d+\.\d+)")
+    
+    i = 0
+    n = len(lines)
+    while i < n:
+        line = lines[i]
+        iso_m = iso_pattern.search(line)
+        if iso_m:
+            idx = int(iso_m.group(1))
+            element = iso_m.group(2)
+            sigma = float(iso_m.group(3))
+            
+            # XX, YY, ZZ は通常、直後の行（1〜3行以内）に出現する
+            xx, yy, zz = None, None, None
+            for offset in range(1, 5):
+                if i + offset >= n:
+                    break
+                subline = lines[i + offset]
+                if xx is None:
+                    xx_m = xx_pattern.search(subline)
+                    if xx_m: xx = float(xx_m.group(1))
+                if yy is None:
+                    yy_m = yy_pattern.search(subline)
+                    if yy_m: yy = float(yy_m.group(1))
+                if zz is None:
+                    zz_m = zz_pattern.search(subline)
+                    if zz_m: zz = float(zz_m.group(1))
+                
+                # 次の原子の行に達した場合は抜ける
+                if iso_pattern.search(subline):
+                    break
+            
+            if xx is not None and yy is not None and zz is not None:
+                atoms.append({
+                    "index": idx,
+                    "element": element,
+                    "sigma": sigma,
+                    "XX": xx,
+                    "YY": yy,
+                    "ZZ": zz
+                })
+        i += 1
+
     return {"atoms": atoms, "filename": filename} if atoms else None
 
 def auto_pad_label(label, element, no):
-    if label == "": return f"{element}{str(no).zfill(2)}_raw"
-    match = re.search(r'(\D+)(\d+)$', label)
+    if not label: return f"{element}{str(no).zfill(2)}_raw"
+    match = re.search(r'(\D+)(\d+)$', str(label))
     if match:
         prefix, num = match.groups()
         return f"{prefix}{num.zfill(2)}"
-    return label
+    return str(label)
 
 def natural_sort_key(s):
-    return [int(t) if t.isdigit() else t.lower() for t in re.split('([0-9]+)', str(s))]
+    return [int(t) if t.isdigit() else t.lower() for t in re.split(r'([0-9]+)', str(s))]
 
 # --- UI Setup ---
 st.set_page_config(page_title="NMR DATA BRIDGE v1.8.2", layout="wide")
@@ -119,6 +163,7 @@ if energy_files and nmr_files:
     energy_map = {get_file_id(f.name): parse_energy_source(f.getvalue(), f.name) for f in energy_files if get_file_id(f.name) is not None}
     frequency_map = {get_file_id(f.name): parse_frequency_source(f.getvalue(), f.name) for f in energy_files if get_file_id(f.name) is not None}
     matched_results = []
+    
     for f in nmr_files:
         fid = get_file_id(f.name)
         parsed_nmr = parse_nmr_source_v181(f.getvalue(), f.name)
@@ -130,7 +175,7 @@ if energy_files and nmr_files:
             })
 
     if matched_results:
-        # 1.5 Frequency / imaginary-mode check (shown before Boltzmann averaging)
+        # 1.5 Frequency / imaginary-mode check
         st.subheader("🫨 Phase 1.5: Frequency Check")
         freq_df = pd.DataFrame({
             "ID": [r["id"] for r in matched_results],
@@ -180,7 +225,7 @@ if energy_files and nmr_files:
         }).sort_values("ID")
         st.dataframe(dist_df.style.format(subset=["Rel. E (kcal/mol)", "Weight (%)"], formatter="{:.2f}"), use_container_width=True)
 
-        # --- Phase 2.5: Raw Data Verification (Updated to English) ---
+        # --- Phase 2.5: Raw Data Verification ---
         st.subheader("🔍 Phase 2.5: Raw Data Verification (All Conformers)")
         raw_rows = []
         for r in matched_results:
@@ -193,7 +238,6 @@ if energy_files and nmr_files:
                     "XX": atom['XX'], "YY": atom['YY'], "ZZ": atom['ZZ']
                 })
         raw_df = pd.DataFrame(raw_rows)
-        # ここを英語に修正しました
         st.write("Raw shielding constants and tensor components extracted from each conformer:")
         st.dataframe(raw_df, use_container_width=True)
         
