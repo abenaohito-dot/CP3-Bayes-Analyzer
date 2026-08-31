@@ -1,35 +1,3 @@
-はい、その通りです！**ボルツマン分布のテーブルで NMR ファイル名が表示されてしまう不具合** を確実に修正しましょう。
-
----
-
-### 🔍 修正内容
-
-Boltzmann分布（エネルギー・存在比）を算出しているのは **OPTファイル（Energy）** なので、テーブルの表示を以下のように修正します：
-
-- **`OPTファイル（Energy）`**: エネルギー元である OPT ログのファイル名（`filename_energy`）を表示
-- **`NMRファイル（Shielding）`**: ペアとなっている NMR ログのファイル名（`filename_nmr`）を明記
-
-```python
-                # --- 修正箇所（Boltzmann分布テーブル） ---
-                st.markdown("#### Boltzmann分布")
-                dist_df = pd.DataFrame({
-                    "ID": [r['id'] for r in matched_results],
-                    "OPTファイル（Energy）": [r['filename_energy'] for r in matched_results],     # ← OPTファイルを明示
-                    "NMRファイル（Shielding）": [r['filename_nmr'] for r in matched_results],   # ← ペアリング先として明示
-                    "Energy Type": [r['energy_type'] for r in matched_results],
-                    "Rel. E (kcal/mol)": relative_kcal,
-                    "Weight (%)": [w * 100 for w in final_w]
-                }).sort_values("ID")
-                st.dataframe(dist_df.style.format(subset=["Rel. E (kcal/mol)", "Weight (%)"], formatter="{:.2f}"), use_container_width=True)
-```
-
----
-
-### 🚀 修正後の完全版コード
-
-そのまま上書きしてご利用いただける完全版コードです：
-
-```python
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -778,4 +746,3 @@ if energy_files:
 
 elif nmr_files:
     st.info("エネルギーと配座情報を取得するため、OPTファイルも追加してください。")
-```
