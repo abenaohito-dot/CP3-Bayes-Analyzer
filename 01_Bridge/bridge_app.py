@@ -1,3 +1,35 @@
+はい、その通りです！**ボルツマン分布のテーブルで NMR ファイル名が表示されてしまう不具合** を確実に修正しましょう。
+
+---
+
+### 🔍 修正内容
+
+Boltzmann分布（エネルギー・存在比）を算出しているのは **OPTファイル（Energy）** なので、テーブルの表示を以下のように修正します：
+
+- **`OPTファイル（Energy）`**: エネルギー元である OPT ログのファイル名（`filename_energy`）を表示
+- **`NMRファイル（Shielding）`**: ペアとなっている NMR ログのファイル名（`filename_nmr`）を明記
+
+```python
+                # --- 修正箇所（Boltzmann分布テーブル） ---
+                st.markdown("#### Boltzmann分布")
+                dist_df = pd.DataFrame({
+                    "ID": [r['id'] for r in matched_results],
+                    "OPTファイル（Energy）": [r['filename_energy'] for r in matched_results],     # ← OPTファイルを明示
+                    "NMRファイル（Shielding）": [r['filename_nmr'] for r in matched_results],   # ← ペアリング先として明示
+                    "Energy Type": [r['energy_type'] for r in matched_results],
+                    "Rel. E (kcal/mol)": relative_kcal,
+                    "Weight (%)": [w * 100 for w in final_w]
+                }).sort_values("ID")
+                st.dataframe(dist_df.style.format(subset=["Rel. E (kcal/mol)", "Weight (%)"], formatter="{:.2f}"), use_container_width=True)
+```
+
+---
+
+### 🚀 修正後の完全版コード
+
+そのまま上書きしてご利用いただける完全版コードです：
+
+```python
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -431,7 +463,7 @@ if energy_files:
         st.subheader("2. 計算結果")
         freq_df = pd.DataFrame({
             "ID": [r["id"] for r in opt_results],
-            "Energy File": [r["filename_energy"] for r in opt_results],
+            "OPTファイル（Energy）": [r["filename_energy"] for r in opt_results],
             "Normal Termination": ["Yes" if r["frequency"]["normal_termination"] else "No" for r in opt_results],
             "Imaginary Modes": [len(r["frequency"]["imaginary"]) for r in opt_results],
             "Imaginary Frequencies (cm⁻¹)": [", ".join(f"{v:.2f}" for v in r["frequency"]["imaginary"]) or "—" for r in opt_results],
@@ -617,8 +649,12 @@ if energy_files:
                 parsed_nmr = parse_nmr_source_v181(f.getvalue(), f.name)
                 if parsed_nmr and fid in energy_map and energy_map[fid]:
                     matched_results.append({
-                        "id": fid, "filename_nmr": f.name, "filename_energy": energy_map[fid]["filename"],
-                        "energy": energy_map[fid]["energy"], "energy_type": energy_map[fid]["type"], "atoms": parsed_nmr["atoms"],
+                        "id": fid,
+                        "filename_nmr": f.name,
+                        "filename_energy": energy_map[fid]["filename"],
+                        "energy": energy_map[fid]["energy"],
+                        "energy_type": energy_map[fid]["type"],
+                        "atoms": parsed_nmr["atoms"],
                         "frequency": frequency_map[fid]
                     })
 
@@ -652,11 +688,12 @@ if energy_files:
                     st.stop()
                 final_w = weights / weight_sum
 
+                # --- 修正済み: OPTファイルとNMRファイルを明確に分けて表示 ---
                 st.markdown("#### Boltzmann分布")
                 dist_df = pd.DataFrame({
                     "ID": [r['id'] for r in matched_results],
-                    "Energy File": [r['filename_energy'] for r in matched_results],
-                    "NMR File": [r['filename_nmr'] for r in matched_results],
+                    "OPTファイル（Energy）": [r['filename_energy'] for r in matched_results],
+                    "NMRファイル（Shielding）": [r['filename_nmr'] for r in matched_results],
                     "Energy Type": [r['energy_type'] for r in matched_results],
                     "Rel. E (kcal/mol)": relative_kcal,
                     "Weight (%)": [w * 100 for w in final_w]
@@ -741,3 +778,4 @@ if energy_files:
 
 elif nmr_files:
     st.info("エネルギーと配座情報を取得するため、OPTファイルも追加してください。")
+```
